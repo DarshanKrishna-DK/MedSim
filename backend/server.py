@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import threading
 from pathlib import Path
 from typing import Optional
@@ -24,6 +25,9 @@ def _load_env_local() -> None:
     Reads `backend/.env.local` (next to this file) and sets any KEY=VALUE
     pair into ``os.environ`` without overwriting values already set.
     Silently no-ops if the file is missing."""
+    # Never load live keys in a test run: the tests once booked real calendar events.
+    if "unittest" in (sys.argv[0] if sys.argv else "") or "pytest" in sys.modules:
+        return
     env_path = Path(__file__).resolve().parent / ".env.local"
     if not env_path.exists():
         return
