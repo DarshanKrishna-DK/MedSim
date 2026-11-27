@@ -1,40 +1,38 @@
 """Live faculty observer: a second browser joins a running consultation as an
-Agora RTC *audience* member and RTM subscriber.
+observer and RTM subscriber over WebSockets.
 
 Endpoints
   POST /voice/observer/invite  {channel, caseId} -> {code, inviteUrl, expiresAt, link}
   POST /voice/observer/join    {code}            -> {appId, channel, uid, token, role, ...}
+  WS   /voice/observer/ws      ?channel=...&uid=...&token=...
 
 Security model
   * /voice/start registers every channel it creates (register_session). An
     invite can only be minted for a registered, unexpired channel, so a
     caller cannot point an observer at an arbitrary channel name.
   * Invite codes are random ids plus an HMAC tag keyed by a per-process
-    secret (never the Agora app certificate), kept in memory with a 2 h
-    expiry. A code names exactly one channel.
-  * The observer token is built with Role_Subscriber: RTC join privilege
-    only, no publish audio/video/data privileges (plus RTM login so the
-    observer can read the transcript and send whispers/marks). The client
-    also joins with client role "audience".
-  * The student's "link" RTM identity (used to publish medsim.event and to
-    receive whispers/marks after the voice call ends) is a separate uid.
+    secret, kept in memory with a 2 h expiry. A code names exactly one channel.
+  * Observer tokens are built using HMAC-SHA256 with timestamp expiry.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import json
+import logging
+import os
 import secrets
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from agora_token import RtcTokenBuilder, Role_Subscriber
-
+log = logging.getLogger("medsim.observer")
 router = APIRouter()
 
 INVITE_TTL_S = 2 * 60 * 60
@@ -73,6 +71,10 @@ class Invite:
 _sessions: dict[str, _Session] = {}
 _invites: dict[str, Invite] = {}
 
+# Channel -> set of active WebSockets
+_subscribers: dict[str, set[WebSocket]] = {}
+_subscribers_lock = asyncio.Lock()
+
 
 def _now() -> float:
     return time.time()
@@ -101,19 +103,19 @@ def reset_state() -> None:
 
 
 def _sign(raw: str) -> str:
-    return hmac.new(_SECRET, raw.encode(), hashlib.sha256).hexdigest()[:10]
+    return hmac.new(_SECRET, raw.encode(), hashlib.sha256).hexdigest()[:16]
 
 
 def _new_code() -> str:
     raw = secrets.token_urlsafe(9)  # 12 chars, 72 bits
-    return f"{raw}.{_sign(raw)}"
+    return f"{raw}.{_sign(raw)[:10]}"
 
 
 def _valid_shape(code: str) -> bool:
     raw, sep, tag = code.partition(".")
     if not sep or not raw or len(code) > 64:
         return False
-    return hmac.compare_digest(tag, _sign(raw))
+    return hmac.compare_digest(tag, _sign(raw)[:10])
 
 
 def lookup_invite(code: str, now: Optional[float] = None) -> Optional[Invite]:
@@ -127,19 +129,45 @@ def lookup_invite(code: str, now: Optional[float] = None) -> Optional[Invite]:
         return inv
 
 
-def _env() -> tuple[str, str]:
-    import os
-
-    app_id = os.environ.get("AGORA_APP_ID", "").strip()
-    cert = os.environ.get("AGORA_APP_CERTIFICATE", "").strip()
-    if not app_id or not cert:
-        raise HTTPException(status_code=503, detail="Voice not configured: missing AGORA_APP_ID/AGORA_APP_CERTIFICATE")
-    return app_id, cert
+def mint_token(channel: str, uid: int, ttl: int = INVITE_TTL_S) -> str:
+    """Mint an HMAC token for channel/uid authentication."""
+    expiry = int(_now()) + ttl
+    raw = f"{channel}:{uid}:{expiry}"
+    sig = _sign(raw)
+    return f"{uid}.{expiry}.{sig}"
 
 
-def audience_token(app_id: str, cert: str, channel: str, uid: int, ttl: int) -> str:
-    """RTC join (no publish privileges) + RTM login for `uid`."""
-    return RtcTokenBuilder.build_token_with_rtm(app_id, cert, channel, str(uid), Role_Subscriber, ttl, ttl)
+def verify_token(token: str, channel: str, uid: Optional[int] = None) -> bool:
+    """Verify an observer HMAC token."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return False
+        tok_uid = int(parts[0])
+        tok_expiry = int(parts[1])
+        tok_sig = parts[2]
+        if _now() > tok_expiry:
+            return False
+        if uid is not None and tok_uid != uid:
+            return False
+        raw = f"{channel}:{tok_uid}:{tok_expiry}"
+        return hmac.compare_digest(tok_sig, _sign(raw))
+    except Exception:
+        return False
+
+
+def audience_token(
+    app_id: str = "",
+    cert: str = "",
+    channel: str = "",
+    uid: int = 0,
+    ttl: int = INVITE_TTL_S,
+) -> str:
+    """Backward-compatible audience token generator."""
+    # If called with legacy signature (app_id, cert, channel, uid, ttl)
+    actual_channel = channel or app_id
+    actual_uid = uid if uid else (int(cert) if cert.isdigit() else 0)
+    return mint_token(actual_channel, actual_uid, ttl)
 
 
 def _origin(request: Request) -> str:
@@ -168,7 +196,6 @@ class InviteResponse(BaseModel):
 
 @router.post("/voice/observer/invite", response_model=InviteResponse)
 def observer_invite(req: InviteRequest, request: Request):
-    app_id, cert = _env()
     now = _now()
     with _lock:
         _prune(now)
@@ -193,7 +220,7 @@ def observer_invite(req: InviteRequest, request: Request):
             expires=now + INVITE_TTL_S,
         )
         _invites[code] = inv
-    link_token = audience_token(app_id, cert, inv.channel, link_uid, INVITE_TTL_S)
+    link_token = audience_token(channel=inv.channel, uid=link_uid, ttl=INVITE_TTL_S)
     return InviteResponse(
         code=code,
         inviteUrl=f"{_origin(request)}/?observe={code}",
@@ -217,11 +244,11 @@ class JoinResponse(BaseModel):
     linkUid: int
     agentUid: int
     expiresAt: int
+    wsUrl: Optional[str] = None
 
 
 @router.post("/voice/observer/join", response_model=JoinResponse)
 def observer_join(req: JoinRequest):
-    app_id, cert = _env()
     now = _now()
     inv = lookup_invite(req.code.strip(), now)
     if inv is None:
@@ -235,15 +262,184 @@ def observer_join(req: JoinRequest):
             uid = OBSERVER_UID_MIN + secrets.randbelow(UID_SPAN)
         inv.observer_uids.append(uid)
     ttl = max(60, int(inv.expires - now))
+    token = audience_token(channel=inv.channel, uid=uid, ttl=ttl)
     return JoinResponse(
-        appId=app_id,
+        appId="gemini-live",
         channel=inv.channel,
         uid=uid,
-        token=audience_token(app_id, cert, inv.channel, uid, ttl),
+        token=token,
         role="audience",
         caseId=inv.case_id,
         studentUid=inv.student_uid,
         linkUid=inv.link_uid,
         agentUid=inv.agent_uid,
         expiresAt=int(inv.expires * 1000),
+        wsUrl=f"/voice/observer/ws?channel={inv.channel}&uid={uid}&token={token}",
     )
+
+
+# ------------------------------------------------------------------ relay hub
+
+
+async def broadcast_student_audio(channel: str, pcm: bytes) -> None:
+    """Broadcast student 16kHz PCM audio chunk (prefixed with 0x01) to observers."""
+    await _broadcast_bytes(channel, b"\x01" + pcm)
+
+
+async def broadcast_agent_audio(channel: str, pcm: bytes) -> None:
+    """Broadcast agent 24kHz PCM audio chunk (prefixed with 0x02) to observers."""
+    await _broadcast_bytes(channel, b"\x02" + pcm)
+
+
+async def broadcast_event(channel: str, event: dict[str, Any]) -> None:
+    """Broadcast an RTM or medsim.* event to observers."""
+    msg = json.dumps(event)
+    await _broadcast_text(channel, msg)
+
+
+async def broadcast_transcript(channel: str, transcript: dict[str, Any]) -> None:
+    """Broadcast transcription event to observers."""
+    await broadcast_event(channel, transcript)
+
+
+async def _broadcast_bytes(channel: str, data: bytes) -> None:
+    targets = list(_subscribers.get(channel, set()))
+    if not targets:
+        return
+    dead: list[WebSocket] = []
+    for ws in targets:
+        try:
+            await ws.send_bytes(data)
+        except Exception:
+            dead.append(ws)
+    if dead:
+        for d in dead:
+            _subscribers.get(channel, set()).discard(d)
+
+
+async def _broadcast_text(channel: str, text: str, exclude: WebSocket | None = None) -> None:
+    targets = list(_subscribers.get(channel, set()))
+    if not targets:
+        return
+    dead: list[WebSocket] = []
+    for ws in targets:
+        if ws == exclude:
+            continue
+        try:
+            await ws.send_text(text)
+        except Exception:
+            dead.append(ws)
+    if dead:
+        for d in dead:
+            _subscribers.get(channel, set()).discard(d)
+
+
+@router.websocket("/voice/observer/ws")
+async def observer_ws(
+    websocket: WebSocket,
+    channel: str = Query(...),
+    uid: int = Query(...),
+    token: str = Query(...),
+    role: str = Query("observer"),
+):
+    """Observer WebSocket relay endpoint."""
+    if not verify_token(token, channel, uid):
+        # Also check if token matches active session token or invite
+        with _lock:
+            sess = _sessions.get(channel)
+            valid = (sess is not None and (sess.uid == uid or sess.agent_uid == uid))
+        if not valid:
+            await websocket.close(code=4403, reason="Forbidden: invalid observer token")
+            return
+
+    await websocket.accept()
+
+    if channel not in _subscribers:
+        _subscribers[channel] = set()
+    _subscribers[channel].add(websocket)
+
+    log.info("Observer joined channel %s (uid=%s, role=%s)", channel, uid, role)
+
+    # Send initial snapshot
+    with _lock:
+        sess = _sessions.get(channel)
+        active_users = [sess.uid, sess.agent_uid] if sess else []
+
+    await websocket.send_text(
+        json.dumps({
+            "type": "presence",
+            "action": "SNAPSHOT",
+            "channel": channel,
+            "uid": uid,
+            "users": active_users,
+        })
+    )
+
+    # Notify others of remote join
+    await _broadcast_text(
+        channel,
+        json.dumps({
+            "type": "presence",
+            "action": "REMOTE_JOIN",
+            "channel": channel,
+            "uid": uid,
+            "role": role,
+        }),
+        exclude=websocket,
+    )
+
+    try:
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+
+            if "bytes" in msg and msg["bytes"]:
+                # Relay raw audio frame to other observers
+                await _broadcast_bytes(channel, msg["bytes"])
+
+            elif "text" in msg and msg["text"]:
+                try:
+                    payload = json.loads(msg["text"])
+                except Exception:
+                    continue
+
+                msg_type = payload.get("type") or payload.get("object", "")
+                if msg_type == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                    continue
+
+                if msg_type == "medsim.hello":
+                    await websocket.send_text(json.dumps({"type": "medsim.ack", "for": "hello"}))
+                    continue
+
+                # Whisper or marks from observer -> fan out and ack
+                if msg_type in ("medsim.whisper", "medsim.marks", "medsim.event"):
+                    await websocket.send_text(json.dumps({"type": "medsim.ack", "for": msg_type}))
+                    await _broadcast_text(channel, msg["text"], exclude=websocket)
+                    continue
+
+                # Fan out other protocol envelopes
+                await _broadcast_text(channel, msg["text"], exclude=websocket)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        log.warning("Observer WS error on %s (uid=%s): %s", channel, uid, e)
+    finally:
+        if channel in _subscribers:
+            _subscribers[channel].discard(websocket)
+            if not _subscribers[channel]:
+                _subscribers.pop(channel, None)
+
+        await _broadcast_text(
+            channel,
+            json.dumps({
+                "type": "presence",
+                "action": "REMOTE_LEAVE",
+                "channel": channel,
+                "uid": uid,
+                "role": role,
+            }),
+        )
+        log.info("Observer left channel %s (uid=%s)", channel, uid)

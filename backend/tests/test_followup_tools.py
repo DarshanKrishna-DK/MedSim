@@ -19,12 +19,14 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import followup_call  # noqa: E402
 import followup_tools  # noqa: E402
+import gemini_live  # noqa: E402
 import llm_proxy  # noqa: E402
 import server  # noqa: E402
 import voice  # noqa: E402
 from integrations import call_reminders, fhir, followup_calls, gcal_script, notify  # noqa: E402
 
 ENV = {
+    "GEMINI_API_KEY": "fake-gemini-key",
     "AGORA_APP_ID": "0" * 32, "AGORA_APP_CERTIFICATE": "1" * 32,
     "AGORA_CUSTOMER_ID": "cust", "AGORA_CUSTOMER_SECRET": "secret",
     "MURF_API_KEY": "murf-test", "SARVAM_API_KEY": "sarvam-test",
@@ -234,7 +236,7 @@ class ToolTurnTests(Base):
         self.assertEqual(len(self.seen), 2)  # max 2 rounds
 
     def test_provider_down_speaks_fallback(self):
-        self.replies = [500]
+        self.replies = [500, 500, 500]
         r = self.turn("hello")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(sse_text(r.text), followup_tools.FALLBACK["en"])
@@ -275,25 +277,20 @@ class PatientSessionTests(Base):
 
 class WiringTests(Base):
     def test_followup_start_tags_proxy_token_and_persona_acts(self):
-        joins: list[dict] = []
-
-        def agora(req: httpx.Request) -> httpx.Response:
-            if req.url.path.endswith("/join"):
-                joins.append(json.loads(req.content or b"{}"))
-            return httpx.Response(200, json={"agent_id": "agent-x"})
-
-        with mock.patch.object(voice, "_client_factory", lambda: httpx.AsyncClient(transport=httpx.MockTransport(agora))), \
-                mock.patch.object(voice.llm_proxy, "public_url", return_value="https://tunnel.test"), \
-                mock.patch.object(followup_call, "_schedule_guard", lambda call, lang: None):
+        with mock.patch.object(followup_call, "_schedule_guard", lambda call, lang: None):
             r = self.client.post(f"/call-api/{self.token}/start")
         self.assertEqual(r.status_code, 200)
-        llm = joins[0]["properties"]["llm"]
-        self.assertEqual(llm["url"], "https://tunnel.test" + llm_proxy.PROXY_PATH)
-        meta = llm_proxy.token_meta(llm["api_key"])
-        self.assertEqual(meta, {"kind": "followup", "callToken": self.token, "callId": r.json()["callId"]})
-        self.assertIn("escalate_red_flag", llm["system_messages"][0]["content"])
-        self.assertIn("reschedule_call", llm["system_messages"][0]["content"])
-        live = followup_call.find_call(self.token, r.json()["callId"])
+        data = r.json()
+        call_id = data["callId"]
+        prep = gemini_live.get_prepared_session(data["channel"])
+        self.assertIsNotNone(prep)
+        self.assertEqual(prep.agent_kind, "followup")
+        self.assertEqual(prep.llm_token_meta, {"kind": "followup", "callToken": self.token, "callId": call_id})
+        self.assertIn("escalate_red_flag", prep.system_prompt)
+        self.assertIn("reschedule_call", prep.system_prompt)
+        tools = gemini_live._build_tools("followup")
+        self.assertTrue(len(tools) > 0)
+        live = followup_call.find_call(self.token, call_id)
         self.assertEqual(live["actions"], followup_call.new_actions())
         # The patient's page never sees the contact on file.
         self.assertNotIn("contact", self.client.get(f"/call-api/{self.token}").json())

@@ -1,6 +1,6 @@
-"""POST /agent/debrief/simple, shift/case debrief without Anthropic.
+"""POST /agent/debrief/simple, shift/case debrief powered by Gemini.
 
-Uses the OpenAI-compatible provider (Sarvam, Groq fallback) in JSON mode.
+Uses the OpenAI-compatible provider in JSON mode.
 """
 
 from __future__ import annotations
@@ -155,7 +155,11 @@ async def debrief_simple(req: DebriefRequest):
     )[:24000]
     msg, _ = await chat(
         [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
-        json_mode=True, max_tokens=1200, temperature=0.2,
+        json_mode=True,
+        max_tokens=1200,
+        temperature=0.2,
+        tier="reasoning",
+        effort="medium",
     )
     try:
         return coerce_debrief(parse_json_object(msg.get("content") or ""), rubric)

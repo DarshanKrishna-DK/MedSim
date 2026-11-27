@@ -20,6 +20,7 @@ import server  # noqa: E402
 import voice  # noqa: E402
 
 KEYS = {
+    "GEMINI_API_KEY": "fake-gemini-key",
     "AGORA_APP_ID": "a" * 32, "AGORA_APP_CERTIFICATE": "b" * 32,
     "AGORA_CUSTOMER_ID": "cid", "AGORA_CUSTOMER_SECRET": "csec",
     "MURF_API_KEY": "murf-zz", "SARVAM_API_KEY": "sarvam-secret-zz",
@@ -126,6 +127,7 @@ class ProxyTests(unittest.TestCase):
         import lang
         calls = self._fail_with(lambda req: httpx.Response(400, json={"detail": "bad sarvam-secret-zz"}))
         os.environ.pop("GROQ_API_KEY", None)
+        os.environ.pop("GEMINI_API_KEY", None)
         r = self.post({"messages": [{"role": "user", "content": "x"}], "stream": True})
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.headers["content-type"].startswith("text/event-stream"))
@@ -165,6 +167,7 @@ class ProxyTests(unittest.TestCase):
             return httpx.Response(200, stream=_Chunks(SSE), headers={"content-type": "text/event-stream"})
         calls = self._fail_with(flaky)
         os.environ.pop("GROQ_API_KEY", None)
+        os.environ.pop("GEMINI_API_KEY", None)
         r = self.post({"messages": [{"role": "user", "content": "any pain?"}], "stream": True})
         self.assertEqual(r.content, SSE)
         self.assertEqual(len(calls), 2)
@@ -179,6 +182,7 @@ class ProxyTests(unittest.TestCase):
         self._fail_with(lambda req: httpx.Response(200, stream=_Broken(),
                                                    headers={"content-type": "text/event-stream"}))
         os.environ.pop("GROQ_API_KEY", None)
+        os.environ.pop("GEMINI_API_KEY", None)
         msgs = [{"role": "system", "content": "You are Ravi. LANGUAGE: Speak natural, everyday spoken Hindi."},
                 {"role": "user", "content": "क्या हुआ?"}]
         r = self.post({"messages": msgs, "stream": True})
@@ -202,38 +206,24 @@ class ProxyTests(unittest.TestCase):
     def test_voice_start_proxy_vs_direct(self):
         req = {"caseId": "c1", "systemPrompt": "sp", "initialLine": "hi", "gender": "M"}
         hdr = {"Origin": "http://localhost:5173"}
-        sent = []
-        orig = voice._client_factory
+        r = self.c.post("/voice/start", json=req, headers=hdr)
+        self.assertEqual(r.status_code, 200, r.text)
+        d = r.json()
+        self.assertEqual(d["mode"], "gemini_live")
+        self.assertEqual(d["model"], "gemini-3.8-live")
+        self.assertTrue(d["wsUrl"].startswith("/voice/live/"))
+        self.assertTrue(d["token"])
+        self.assertEqual(d["sampleRateIn"], 16000)
+        self.assertEqual(d["sampleRateOut"], 24000)
 
-        def cap(req_):
-            sent.append(json.loads(req_.content))
-            return httpx.Response(200, json={"agent_id": "ag1"})
-        voice._client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(cap))
-        try:
-            r = self.c.post("/voice/start", json=req, headers=hdr)
-            self.assertEqual(r.status_code, 200, r.text)
-            llm = sent[-1]["properties"]["llm"]
-            self.assertEqual(llm["url"], "https://api.sarvam.ai/v1/chat/completions")
-            self.assertNotIn("vendor", llm)
-            td = sent[-1]["properties"]["turn_detection"]["config"]
-            self.assertEqual(td["speech_threshold"], 0.6)
-            self.assertEqual(td["start_of_speech"]["vad_config"]["interrupt_duration_ms"], 200)
-            self.assertEqual(td["end_of_speech"]["vad_config"]["silence_duration_ms"], 560)
-            self.assertEqual(llm["failure_message"], "Hmm, sorry, say that once more?")
-            self.assertNotIn("sarvam-secret-zz", r.text)
-
-            os.environ["PUBLIC_URL"] = "https://t.example.com/"
-            r = self.c.post("/voice/start", json=req, headers=hdr)
-            llm = sent[-1]["properties"]["llm"]
-            self.assertEqual(llm["vendor"], "custom")
-            self.assertEqual(llm["url"], "https://t.example.com" + llm_proxy.PROXY_PATH)
-            self.assertTrue(llm_proxy.valid_token(llm["api_key"]))
-            self.assertNotEqual(llm["api_key"], "sarvam-secret-zz")
-            self.assertIn("turn_detection", sent[-1]["properties"])
-            self.assertNotIn("sarvam-secret-zz", r.text)
-            self.assertEqual(self.c.get("/health").json()["llm"]["patient_route"], "proxy via t.example.com")
-        finally:
-            voice._client_factory = orig
+    def test_effort_clamping_low_medium_only(self):
+        import llm_provider
+        self.assertEqual(llm_provider.clamp_effort("high"), "medium")
+        self.assertEqual(llm_provider.clamp_effort("xhigh"), "medium")
+        self.assertEqual(llm_provider.clamp_effort("HIGH"), "medium")
+        self.assertEqual(llm_provider.clamp_effort("low"), "low")
+        self.assertEqual(llm_provider.clamp_effort("medium"), "medium")
+        self.assertEqual(llm_provider.clamp_effort(None), "low")
 
 
 if __name__ == "__main__":

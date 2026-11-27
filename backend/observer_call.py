@@ -1,18 +1,18 @@
 """Invite an observer by name, and Asha phones them.
 
 The doctor says "invite Darshan to observe" (or presses "Call & invite").
-The browser mints the Agora observer link (/voice/observer/invite), then:
+The browser mints the observer link (/voice/observer/invite), then:
 
   POST /agent/observer/call        {contact, inviteUrl, student, case, available, note?}
        -> {token, status, delivery, spoken, error?}
        Sends the link (Telegram, else SMS / WhatsApp), pre-renders Asha's opener
-       with Murf, then places a Twilio call whose TwiML lives at a public URL.
+       with Gemini TTS, then places a Twilio call whose TwiML lives at a public URL.
   GET  /agent/observer/call/{token}         doctor-side status + transcript + messages
   GET  /agent/observer/call/{token}/events  messages the observer left (?after=n)
 
 Public (Twilio's cloud has no origin), token-guarded and signature-checked:
   GET|POST /rx/obs-call/{token}/twiml     <Gather input="speech"> wrapping the opener <Play> (barge-in)
-  POST     /rx/obs-call/{token}/turn      SpeechResult -> LLM answer -> Murf -> TwiML loop
+  POST     /rx/obs-call/{token}/turn      SpeechResult -> LLM answer -> Gemini TTS -> TwiML loop
   POST     /rx/obs-call/{token}/status    Twilio StatusCallback (ringing, completed, ...)
 
 Twilio trial facts (verified on this account): the Calls API accepts a custom
@@ -395,17 +395,17 @@ async def answer(ctx: dict[str, Any], question: str) -> dict[str, Any]:
 
 
 async def speech_url(text: str, timeout: float = TTS_TIMEOUT_S) -> Optional[str]:
-    """Murf (Asha's voice) MP3 hosted at a public /rx/audio URL, or None (then <Say>)."""
-    if not _env("MURF_API_KEY") or not notify.absolute_url("/"):
+    """Gemini TTS (Asha's voice) WAV hosted at a public /rx/audio URL, or None (then <Say>)."""
+    if not _env("GEMINI_API_KEY") or not notify.absolute_url("/"):
         return None
     try:
         import rx_audio
 
-        mp3, _, _ = await asyncio.wait_for(rx_audio.synthesize(text, "en"), timeout=timeout)
+        wav, _, _ = await asyncio.wait_for(rx_audio.synthesize(text, "en"), timeout=timeout)
     except Exception as e:  # noqa: BLE001
         log.warning("observer call TTS failed: %s", type(e).__name__)
         return None
-    return notify.absolute_url(notify.store_audio(mp3))
+    return notify.absolute_url(notify.store_audio(wav))
 
 
 def _speak(text: str, url: Optional[str]) -> str:

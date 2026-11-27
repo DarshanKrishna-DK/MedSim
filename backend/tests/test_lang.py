@@ -17,6 +17,8 @@ import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import coach  # noqa: E402
+import gemini_live  # noqa: E402
+import gemini_tts  # noqa: E402
 import lang  # noqa: E402
 import nurse  # noqa: E402
 import server  # noqa: E402
@@ -24,6 +26,7 @@ import teacher  # noqa: E402
 import voice  # noqa: E402
 
 SECRETS = {
+    "GEMINI_API_KEY": "fake-gemini-key",
     "AGORA_APP_ID": "a" * 32,
     "AGORA_APP_CERTIFICATE": "b" * 32,
     "AGORA_CUSTOMER_ID": "cust-id-zz",
@@ -151,7 +154,6 @@ class LangUnitTests(unittest.TestCase):
             self.assertTrue(lang.has_script(p, "hi"), p)
         for p in lang.fillers("kn"):
             self.assertTrue(lang.has_script(p, "kn"), p)
-        self.assertEqual(voice.filler_block("kn")["content"]["static_config"]["phrases"], lang.fillers("kn"))
 
     def test_language_blocks(self) -> None:
         self.assertIn("MIXED LANGUAGES", lang.language_block("en"))
@@ -190,13 +192,11 @@ class LangUnitTests(unittest.TestCase):
                     self.assertTrue(lang.has_script(line, lg), f"{lg}: {line}")
             self.assertIn(lang.natural_retry_line(lg), lang.NATURAL_RETRY_LINES[lg])
 
-    def test_voice_for_ignores_english_override_for_indic(self) -> None:
+    def test_voice_for_nurse(self) -> None:
         old = os.environ.get("MURF_NURSE_VOICE")
-        os.environ["MURF_NURSE_VOICE"] = "en-US-custom"
+        os.environ["MURF_NURSE_VOICE"] = "custom-voice"
         try:
-            self.assertEqual(voice._voice_for("nurse"), "en-US-custom")
-            self.assertEqual(voice._voice_for("nurse", None, "kn"), "kn-IN-harshitha")
-            self.assertEqual(voice._voice_for("nurse", None, "hi"), "en-IN-anisha")
+            self.assertEqual(voice._voice_for("nurse"), "custom-voice")
         finally:
             if old is None:
                 os.environ.pop("MURF_NURSE_VOICE", None)
@@ -243,19 +243,17 @@ class VoiceLocaleTests(unittest.TestCase):
         os.environ["PATIENT_LLM_PROVIDER"] = "sarvam"
         os.environ.pop("VOICE_ASR", None)
         os.environ.pop("PUBLIC_URL", None)
-        self.sent: list[dict] = []
+        self.tts_calls: list[dict] = []
 
-        def handler(req: httpx.Request) -> httpx.Response:
-            if req.url.path.endswith("/join"):
-                self.sent.append(json.loads(req.content))
-                return httpx.Response(200, json={"agent_id": "A1"})
-            if req.url.host.endswith("murf.ai"):
-                self.sent.append(json.loads(req.content))
-                return httpx.Response(200, content=b"ID3audio")
-            return httpx.Response(200, json={})
+        FAKE_WAV = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
 
-        self._orig = voice._client_factory
-        voice._client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        async def fake_synth(text, voice="Aoede", **kw):
+            self.tts_calls.append({"text": text, "voice": voice, **kw})
+            return FAKE_WAV, "audio/wav"
+
+        self._orig_synth = gemini_tts.synthesize_speech
+        gemini_tts.synthesize_speech = fake_synth
+
         self._orig_tr = lang.translate_line
 
         async def fake_translate(text, lg):
@@ -265,7 +263,7 @@ class VoiceLocaleTests(unittest.TestCase):
         self.client = TestClient(server.app)
 
     def tearDown(self) -> None:
-        voice._client_factory = self._orig
+        gemini_tts.synthesize_speech = self._orig_synth
         lang.translate_line = self._orig_tr
         for k, v in self._old.items():
             if v is None:
@@ -273,68 +271,58 @@ class VoiceLocaleTests(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-    def _start(self, locale, gender: str = "F") -> dict:
+    def _start(self, locale, gender: str = "F"):
         body = {"caseId": "c-77", "systemPrompt": "sp", "initialLine": "Chest pain", "gender": gender}
         if locale:
             body["locale"] = locale
         r = self.client.post("/voice/start", headers=HDR, json=body)
         self.assertEqual(r.status_code, 200, r.text)
-        return self.sent[-1]["properties"]
+        channel = r.json()["channel"]
+        return gemini_live.get_prepared_session(channel)
 
     def test_start_hindi(self) -> None:
         p = self._start("hi-IN")
-        self.assertEqual(p["tts"]["params"]["locale"], "hi-IN")
-        self.assertIn(p["tts"]["params"]["voiceId"], HI_OK)
-        self.assertEqual(p["asr"]["params"]["language"], "unknown")
-        self.assertEqual(p["llm"]["greeting_message"], "मुझे सीने में दर्द है")
-        self.assertIn("हाँ डॉक्टर...", p["filler_words"]["content"]["static_config"]["phrases"])
-        self.assertTrue(lang.has_script(p["llm"]["failure_message"], "hi"))
+        self.assertEqual(p.locale, "hi")
+        self.assertEqual(p.initial_line, "मुझे सीने में दर्द है")
 
     def test_start_kannada(self) -> None:
         for g in ("M", "F"):
             p = self._start("kn-IN", g)
-            self.assertEqual(p["tts"]["params"]["locale"], "kn-IN")
-            self.assertIn(p["tts"]["params"]["voiceId"], KN_OK)
-            self.assertEqual(p["llm"]["greeting_message"], "ನನಗೆ ಎದೆ ನೋವು ಇದೆ")
-            self.assertIn("ಹೌದು ಡಾಕ್ಟರ್...", p["filler_words"]["content"]["static_config"]["phrases"])
+            self.assertEqual(p.locale, "kn")
+            self.assertEqual(p.initial_line, "ನನಗೆ ಎದೆ ನೋವು ಇದೆ")
 
     def test_start_new_languages(self) -> None:
         for lg, ok in NEW_LANGS.items():
             for g in ("M", "F"):
                 p = self._start(f"{lg}-IN", g)
-                self.assertEqual(p["tts"]["params"]["locale"], f"{lg}-IN")
-                self.assertIn(p["tts"]["params"]["voiceId"], ok)
-                self.assertEqual(p["asr"]["params"]["language"], "unknown")
-                self.assertTrue(lang.has_script(p["llm"]["failure_message"], lg))
-                phrases = p["filler_words"]["content"]["static_config"]["phrases"]
-                self.assertEqual(phrases, lang.fillers(lg))
+                self.assertEqual(p.locale, lg)
+                self.assertTrue(lang.has_script(lang.failure_message(lg), lg))
 
     def test_tts_new_language_nurse(self) -> None:
         for lg, ok in NEW_LANGS.items():
             body = {"text": SAMPLE_TEXT[lg], "voice": "nurse", "locale": f"{lg}-IN"}
             r = self.client.post("/voice/tts", headers=HDR, json=body)
             self.assertEqual(r.status_code, 200, r.text)
-            self.assertEqual(self.sent[-1]["locale"], f"{lg}-IN")
-            self.assertIn(self.sent[-1]["voiceId"], ok)
+            self.assertEqual(r.headers["content-type"], "audio/wav")
 
     def test_start_english_unchanged(self) -> None:
         p = self._start(None)
-        self.assertEqual(p["tts"]["params"]["locale"], "en-IN")
-        self.assertEqual(p["llm"]["greeting_message"], "Chest pain")
-        self.assertIn("Haan, doctor...", p["filler_words"]["content"]["static_config"]["phrases"])
+        self.assertEqual(p.locale, "en")
+        self.assertEqual(p.initial_line, "Chest pain")
 
     def test_tts_locale_and_voice(self) -> None:
         r = self.client.post("/voice/tts", headers=HDR, json={"text": "ठीक है डॉक्टर", "voice": "nurse", "locale": "hi-IN"})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(self.sent[-1]["locale"], "hi-IN")
-        self.assertIn(self.sent[-1]["voiceId"], HI_OK)
+        self.assertEqual(r.headers["content-type"], "audio/wav")
+        self.assertEqual(self.tts_calls[-1]["voice"], "Aoede")
+
         r = self.client.post("/voice/tts", headers=HDR, json={"text": "ಸರಿ ಡಾಕ್ಟರ್", "voice": "nurse", "locale": "kn-IN"})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(self.sent[-1]["locale"], "kn-IN")
-        self.assertEqual(self.sent[-1]["voiceId"], "kn-IN-harshitha")
+        self.assertEqual(r.headers["content-type"], "audio/wav")
+        self.assertEqual(self.tts_calls[-1]["voice"], "Aoede")
+
         self.client.post("/voice/tts", headers=HDR, json={"text": "Okay doctor"})
-        self.assertEqual(self.sent[-1]["locale"], "en-US")
-        self.assertEqual(self.sent[-1]["voiceId"], "en-IN-anisha")
+        self.assertEqual(self.tts_calls[-1]["voice"], "Aoede")
 
 
 if __name__ == "__main__":

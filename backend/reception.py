@@ -2,7 +2,7 @@
 
 Priya at Reception answers questions about the student's assignment and scores and
 can email the assignment report to the teacher. OpenAI-compatible tool loop
-(llm_provider.chat, Sarvam first, Groq fallback), same pattern as nurse._run_native
+(llm_provider.chat powered by Gemini), same pattern as nurse._run_native
 but self-contained. When no LLM is reachable a keyword router runs the same tools,
 so the front desk still works offline.
 
@@ -193,7 +193,15 @@ def _system_prompt(st: ReceptionState) -> str:
 async def _run_native(st: ReceptionState, messages: list[dict[str, Any]], steps: list[dict[str, Any]]) -> str:
     provider: Optional[str] = None
     for _ in range(MAX_ITERATIONS):
-        msg, provider = await chat(messages, tools=TOOL_SPECS, max_tokens=400, temperature=0.2, stick_to=provider)
+        msg, provider = await chat(
+            messages,
+            tools=TOOL_SPECS,
+            max_tokens=400,
+            temperature=0.2,
+            stick_to=provider,
+            tier="fast",
+            effort="low",
+        )
         content = strip_think(msg.get("content") or "")
         calls = msg.get("tool_calls") or []
         if not calls:
@@ -215,7 +223,13 @@ async def _run_native(st: ReceptionState, messages: list[dict[str, Any]], steps:
                 res = await st.execute(name, args)
                 steps.append({"tool": name, "args": args, "ok": bool(res.get("ok")), "summary": summarize(name, res), "result": res})
             messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(res)})
-    msg, _ = await chat(messages + [{"role": "user", "content": "Give the short spoken reply now."}], max_tokens=120, stick_to=provider)
+    msg, _ = await chat(
+        messages + [{"role": "user", "content": "Give the short spoken reply now."}],
+        max_tokens=120,
+        stick_to=provider,
+        tier="fast",
+        effort="low",
+    )
     return strip_think(msg.get("content") or "")
 
 

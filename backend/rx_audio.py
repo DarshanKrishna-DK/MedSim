@@ -4,11 +4,9 @@
     -> {script, audioBase64, mime, voiceId, locale, lang}
 
 Many Indian patients cannot read a prescription. After the doctor prescribes,
-this writes a short, plain-language counselling script (Sarvam, Groq fallback)
-and speaks it with Murf Falcon (MP3). The script may only restate the given
+this writes a short, plain-language counselling script
+and speaks it with Gemini TTS (RIFF WAV). The script may only restate the given
 prescription: no new drugs, no dose changes.
-
-Secrets are read from the environment per call and never logged or returned.
 """
 
 from __future__ import annotations
@@ -19,19 +17,18 @@ import logging
 import re
 from typing import Any, Optional
 
-import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+import gemini_tts
 import lang as langmod
-import voice
 from llm_provider import chat, strip_think
 
 log = logging.getLogger("medsim.rx")
 router = APIRouter()
 
 MAX_WORDS = 190  # spec: 120-180 words; small slack before we trim
-CHUNK_CHARS = 600  # per Murf stream call (same cap as /voice/tts)
+CHUNK_CHARS = 600  # per TTS call cap
 SCRIPT_TIMEOUT_S = 25.0
 
 
@@ -116,7 +113,7 @@ def build_user_message(req: RxAudioRequest) -> str:
 def build_system(lang: str) -> str:
     if lang == "en":
         return SYSTEM + "\nLANGUAGE: simple spoken Indian English, short common words."
-    name = langmod.LANG_NAMES[lang]
+    name = langmod.LANG_NAMES.get(lang, "Hindi")
     return (
         SYSTEM
         + f"\nLANGUAGE: write the whole script in natural, simple spoken {name} in its native script, as a local "
@@ -146,7 +143,7 @@ def split_chunks(text: str, limit: int = CHUNK_CHARS) -> list[str]:
     out: list[str] = []
     cur = ""
     for s in sentences:
-        while len(s) > limit:  # pathological sentence: hard split on a space
+        while len(s) > limit:
             k = s.rfind(" ", 0, limit)
             k = k if k > 0 else limit
             if cur:
@@ -170,7 +167,7 @@ async def generate_script(req: RxAudioRequest, lang: str) -> str:
         msg, _ = await asyncio.wait_for(chat(msgs, max_tokens=1400, temperature=0.3), timeout=SCRIPT_TIMEOUT_S)
     except HTTPException:
         raise
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         raise HTTPException(status_code=502, detail=f"Script generation failed: {type(e).__name__}")
     script = clean_script(msg.get("content") or "")
     if len(script.split()) < 20 or (lang != "en" and not langmod.has_script(script, lang)):
@@ -178,41 +175,40 @@ async def generate_script(req: RxAudioRequest, lang: str) -> str:
     return script
 
 
-async def synthesize(script: str, lang: str) -> tuple[bytes, str, str]:
-    key = voice._require_env("MURF_API_KEY")["MURF_API_KEY"]
-    voice_id, locale = voice.tts_voice_and_locale(
-        voice.VoiceTtsRequest(text="x", voice="nurse", locale=langmod.locale_for(lang))
-    )
-    audio = b""
-    for piece in split_chunks(script):
-        body = {
-            "text": piece,
-            "voiceId": voice_id,
-            "model": "falcon-2.1",
-            "format": "MP3",
-            "sampleRate": 24000,
-            "locale": locale,
-        }
+async def synthesize(script: str, lang: str, case_id: str = "case") -> tuple[bytes, str, str]:
+    """Synthesize prescription script to RIFF WAV using Gemini TTS and concat chunks."""
+    if not gemini_tts._get_api_key():
+        raise HTTPException(status_code=503, detail="Gemini TTS not configured: missing GEMINI_API_KEY")
+    voice_name = gemini_tts.pick_voice_for_role("nurse", case_id, lang)
+    locale = langmod.locale_for(lang)
+    chunks = split_chunks(script)
+    wav_chunks: list[bytes] = []
+
+    for piece in chunks:
+        if not piece.strip():
+            continue
         try:
-            async with voice._client_factory() as c:
-                r = await c.post(voice.MURF_STREAM_URL, json=body, headers={"api-key": key})
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Murf request failed: {type(e).__name__}")
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Murf TTS failed ({r.status_code}): {r.text[:300]}")
-        audio += r.content
-    return audio, voice_id, locale
+            wav_bytes, _ = await gemini_tts.synthesize_speech(piece, voice=voice_name)
+            wav_chunks.append(wav_bytes)
+        except Exception as e:
+            log.warning("Gemini TTS synthesis failed for chunk: %s", e)
+            raise HTTPException(status_code=502, detail=f"Gemini TTS failed: {type(e).__name__}")
+
+    audio = gemini_tts.concat_audio_chunks(wav_chunks)
+    return audio, voice_name, locale
 
 
 @router.post("/voice/rx-audio")
 async def voice_rx_audio(req: RxAudioRequest) -> dict[str, Any]:
+    if not gemini_tts._get_api_key():
+        raise HTTPException(status_code=503, detail="Gemini TTS not configured: missing GEMINI_API_KEY")
     lang = langmod.norm_lang(req.lang)
     script = await generate_script(req, lang)
-    audio, voice_id, locale = await synthesize(script, lang)
+    audio, voice_id, locale = await synthesize(script, lang, case_id=req.caseId)
     return {
         "script": script,
         "audioBase64": base64.b64encode(audio).decode(),
-        "mime": "audio/mpeg",
+        "mime": "audio/wav",
         "voiceId": voice_id,
         "locale": locale,
         "lang": lang,

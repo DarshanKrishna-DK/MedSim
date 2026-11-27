@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
 
 import lang as langmod
 from llm_provider import configured_providers
@@ -217,7 +218,43 @@ def build_upstream_body(payload: dict[str, Any], cfg: dict[str, str]) -> dict[st
     body = {k: payload[k] for k in _ALLOWED_FIELDS if k in payload and payload[k] is not None}
     body["messages"] = sanitize_messages(payload.get("messages"))
     body["model"] = cfg["model"]  # never trust the client's model
+    if "reasoning_effort" in payload:
+        from llm_provider import clamp_effort
+        body["reasoning_effort"] = clamp_effort(payload["reasoning_effort"], default="low")
+    elif cfg.get("provider") == "gemini" or "generativelanguage" in cfg.get("url", ""):
+        from llm_provider import clamp_effort
+        body["reasoning_effort"] = clamp_effort(cfg.get("reasoning_effort"), default="low")
     return body
+
+
+class PatientChatRequest(BaseModel):
+    system: str = ""
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    temperature: float = 0.7
+    max_tokens: int = 400
+    tier: str = "fast"
+    effort: str = "low"
+
+
+@router.post("/agent/patient/chat")
+async def patient_chat(req: PatientChatRequest):
+    """Direct route for patient chat turns via Google Gemini."""
+    from llm_provider import chat, clamp_effort
+
+    msgs: list[dict[str, Any]] = []
+    if req.system:
+        msgs.append({"role": "system", "content": req.system})
+    msgs.extend(sanitize_messages(req.messages))
+    effort = clamp_effort(req.effort, default="low")
+    msg, provider = await chat(
+        msgs,
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+        tier=req.tier if req.tier in ("fast", "reasoning") else "fast",
+        effort=effort,
+    )
+    return {"reply": msg.get("content") or "", "role": "assistant", "provider": provider}
+
 
 
 # ---------------------------------------------------------------- nurse-addressed turns

@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import httpx  # noqa: E402
 
 ENV = {
+    "GEMINI_API_KEY": "fake-gemini-key",
     "AGORA_APP_ID": "0" * 32,
     "AGORA_APP_CERTIFICATE": "1" * 32,
     "AGORA_CUSTOMER_ID": "cust",
@@ -116,26 +117,13 @@ class EndpointTest(unittest.TestCase):
         self._env.start()
         os.environ.pop("PATIENT_LLM_PROVIDER", None)
         import followup_call
+        import gemini_live
         import server
         import voice
         from integrations import followup_calls as reg
 
-        self.fc, self.voice, self.reg = followup_call, voice, reg
+        self.fc, self.voice, self.reg, self.gemini_live = followup_call, voice, reg, gemini_live
         followup_call._history.clear()
-        self.calls: list[tuple[str, str, dict]] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            body = json.loads(request.content or b"{}")
-            self.calls.append((request.method, request.url.path, body))
-            if request.url.path.endswith("/join"):
-                return httpx.Response(200, json={"agent_id": f"agent-{len(self.calls)}"})
-            return httpx.Response(200, json={})
-
-        transport = httpx.MockTransport(handler)
-        self._cf = mock.patch.object(voice, "_client_factory", lambda: httpx.AsyncClient(transport=transport))
-        self._cf.start()
-        self._pub = mock.patch.object(voice.llm_proxy, "public_url", return_value=None)
-        self._pub.start()
         self._guard = mock.patch.object(followup_call, "_schedule_guard", lambda call, lang: None)
         self._guard.start()
         from fastapi.testclient import TestClient
@@ -145,12 +133,7 @@ class EndpointTest(unittest.TestCase):
 
     def tearDown(self):
         self._guard.stop()
-        self._pub.stop()
-        self._cf.stop()
         self._env.stop()
-
-    def joins(self):
-        return [c for c in self.calls if c[1].endswith("/join")]
 
     def test_info_is_public_and_404_for_unknown(self):
         # No Origin header at all, like a phone opening the link.
@@ -173,18 +156,17 @@ class EndpointTest(unittest.TestCase):
         self.assertEqual(d["maxSeconds"], 240)
         self.assertEqual(d["callsLeftToday"], 2)
         self.assertTrue(d["channel"].startswith("asha-followup-call-"))
-        props = self.joins()[0][2]["properties"]
-        self.assertEqual(props["idle_timeout"], self.fc.IDLE_TIMEOUT_S)
-        self.assertEqual(props["tts"]["params"]["voiceId"], "en-IN-anisha")
-        self.assertIn("Nurse Asha", props["llm"]["greeting_message"])
-        self.assertIn("Nurse Asha", props["llm"]["system_messages"][0]["content"])
+        prep = self.gemini_live.get_prepared_session(d["channel"])
+        self.assertIsNotNone(prep)
+        self.assertEqual(prep.agent_kind, "followup")
+        self.assertIn("Nurse Asha", prep.initial_line)
+        self.assertIn("Nurse Asha", prep.system_prompt)
         # Stop accepts a sendBeacon text/plain body.
         r = self.client.post(
             f"/call-api/{self.token}/stop", content=json.dumps({"agentId": d["agentId"]}),
             headers={"Content-Type": "text/plain"},
         )
         self.assertEqual(r.json(), {"ok": True, "stopped": 1})
-        self.assertTrue(any(c[1].endswith(f"/agents/{d['agentId']}/leave") for c in self.calls))
         # A foreign agent id is not stopped through this link.
         r = self.client.post(f"/call-api/{self.token}/stop", json={"agentId": "someone-else"})
         self.assertEqual(r.json()["stopped"], 0)
@@ -194,10 +176,17 @@ class EndpointTest(unittest.TestCase):
             self.assertEqual(self.client.post(f"/call-api/{self.token}/start").status_code, 200, i)
         r = self.client.post(f"/call-api/{self.token}/start")
         self.assertEqual(r.status_code, 429)
-        self.assertEqual(len(self.joins()), 3)
-        # A second start leaves the previous live agent first (one Asha per link).
-        leaves = [c for c in self.calls if c[1].endswith("/leave")]
-        self.assertEqual(len(leaves), 2)
+
+    def test_failed_join_does_not_count(self):
+        with mock.patch.object(self.voice, "start_agent_session", side_effect=self.voice.HTTPException(502, "x")):
+            self.assertEqual(self.client.post(f"/call-api/{self.token}/start").status_code, 502)
+        self.assertEqual(self.fc.calls_left(self.token), 3)
+
+    def test_voice_start_unchanged(self):
+        r = self.client.post("/voice/start", json={"caseId": "im-001", "systemPrompt": "p", "initialLine": "hi", "gender": "F"},
+                             headers={"Origin": "http://localhost:5173"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["channel"].startswith("medsim-im-001-"))
         # The window rolls after 24 hours.
         with mock.patch.object(self.fc.time, "time", return_value=time.time() + self.fc.DAY_S + 1):
             self.assertEqual(self.fc.calls_left(self.token), 3)
@@ -266,15 +255,6 @@ class EndpointTest(unittest.TestCase):
             r = self.client.post(f"/call-api/{self.token}/summary", json={"transcript": [{"role": "user", "content": "chest pain"}]})
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()["summary"]["followUpNeeded"])
-
-    def test_voice_start_unchanged(self):
-        r = self.client.post("/voice/start", json={"caseId": "im-001", "systemPrompt": "p", "initialLine": "hi", "gender": "F"},
-                             headers={"Origin": "http://localhost:5173"})
-        self.assertEqual(r.status_code, 200, r.text)
-        props = self.joins()[0][2]["properties"]
-        self.assertEqual(props["idle_timeout"], self.voice.AGENT_IDLE_TIMEOUT_S)
-        self.assertTrue(r.json()["channel"].startswith("medsim-im-001-"))
-        self.assertNotEqual(props["tts"]["params"]["voiceId"], "en-IN-anisha")
 
 
 class GuardTest(unittest.TestCase):

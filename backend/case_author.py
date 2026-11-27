@@ -448,7 +448,14 @@ async def generate_case(answers: dict, author: str = "", *, chat: Optional[ChatF
     chat = chat or llm_provider.chat
     cid = case_id or new_case_id()
     messages = build_messages(answers)
-    msg, _ = await chat(messages, json_mode=True, max_tokens=3000, temperature=0.4)
+    msg, _ = await chat(
+        messages,
+        json_mode=True,
+        max_tokens=3000,
+        temperature=0.4,
+        tier="reasoning",
+        effort="medium",
+    )
     raw = msg.get("content") or ""
     case = normalise(parse_json(raw), answers, cid, author)
     errors = validate_case(case)
@@ -460,7 +467,14 @@ async def generate_case(answers: dict, author: str = "", *, chat: Optional[ChatF
                                         + "\n- ".join(errors[:25])},
         ]
         try:
-            msg2, _ = await chat(repair, json_mode=True, max_tokens=3000, temperature=0.2)
+            msg2, _ = await chat(
+                repair,
+                json_mode=True,
+                max_tokens=3000,
+                temperature=0.2,
+                tier="reasoning",
+                effort="medium",
+            )
             case = normalise(parse_json(msg2.get("content") or ""), answers, cid, author)
         except CaseAuthorError:
             pass  # keep the first draft, try the mechanical fixes below

@@ -23,6 +23,7 @@ import agent_runtime  # noqa: E402
 import agent_toolsets  # noqa: E402
 import assignments as asg  # noqa: E402
 import followup_tools  # noqa: E402
+import gemini_live  # noqa: E402
 import llm_proxy  # noqa: E402
 import server  # noqa: E402
 import voice  # noqa: E402
@@ -30,6 +31,7 @@ from integrations import gcal_script, notify  # noqa: E402
 from integrations.calendar_invite import IST  # noqa: E402
 
 ENV = {
+    "GEMINI_API_KEY": "fake-gemini-key",
     "AGORA_APP_ID": "0" * 32, "AGORA_APP_CERTIFICATE": "1" * 32,
     "AGORA_CUSTOMER_ID": "cust", "AGORA_CUSTOMER_SECRET": "secret",
     "MURF_API_KEY": "murf-test", "SARVAM_API_KEY": "sarvam-test",
@@ -210,7 +212,7 @@ class SseTests(Base):
         self.assertEqual(r.json()["choices"][0]["message"]["content"], "Hi there")
 
     def test_provider_down_speaks_fallback(self):
-        self.replies = [500]
+        self.replies = [500, 500, 500]
         r = self.turn(llm_proxy.mint_token(self.meta("receptionist")), "hello")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(sse_text(r.text), agent_runtime.DEFAULT_FALLBACK["en"])
@@ -504,52 +506,47 @@ class EventBusTests(Base):
 # ---------------------------------------------------------------- session wiring
 
 class WiringTests(Base):
-    def start(self, body: dict, public: bool = True):
-        joins: list[dict] = []
-
-        def agora(req: httpx.Request) -> httpx.Response:
-            if req.url.path.endswith("/join"):
-                joins.append(json.loads(req.content or b"{}"))
-            return httpx.Response(200, json={"agent_id": "agent-r1"})
-
-        with mock.patch.object(voice, "_client_factory", lambda: httpx.AsyncClient(transport=httpx.MockTransport(agora))), \
-                mock.patch.object(voice.llm_proxy, "public_url", return_value="https://tunnel.test" if public else None):
-            r = self.client.post("/voice/start", json=body, headers=DEV)
-        return r, joins
+    def start(self, body: dict):
+        return self.client.post("/voice/start", json=body, headers=DEV)
 
     def test_receptionist_start_tags_token_with_ctx(self):
-        r, joins = self.start({"caseId": "receptionist", "systemPrompt": "Priya", "initialLine": "Namaste", "gender": "F",
-                               "agentContext": {"assignmentCode": "ABC234", "knownCodes": ["ABC234"], "junk": 1}})
+        r = self.start({"caseId": "receptionist", "systemPrompt": "Priya", "initialLine": "Namaste", "gender": "F",
+                        "agentContext": {"assignmentCode": "ABC234", "knownCodes": ["ABC234"], "junk": 1}})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertTrue(r.json()["toolsEnabled"])
-        tok = joins[0]["properties"]["llm"]["api_key"]
-        meta = llm_proxy.token_meta(tok)
-        self.assertEqual(meta["kind"], "receptionist")
-        self.assertEqual(meta["channel"], r.json()["channel"])
-        self.assertEqual(meta["ctx"], {"assignmentCode": "ABC234", "knownCodes": ["ABC234"]})
-        self.assertEqual(llm_proxy.agent_token("agent-r1"), tok)
-        # /voice/context merges new ctx without an Agora call.
-        c = self.client.post("/voice/context", json={"agentId": "agent-r1", "agentContext": {"contact": "+919876543210"}},
+        data = r.json()
+        self.assertTrue(data["toolsEnabled"])
+        self.assertEqual(data["mode"], "gemini_live")
+        prep = gemini_live.get_prepared_session(data["channel"])
+        self.assertIsNotNone(prep)
+        self.assertEqual(prep.agent_kind, "receptionist")
+        self.assertEqual(prep.agent_ctx, {"assignmentCode": "ABC234", "knownCodes": ["ABC234"]})
+        # /voice/context merges new ctx
+        c = self.client.post("/voice/context", json={"agentId": data["channel"], "agentContext": {"contact": "+919876543210"}},
                              headers=DEV)
         self.assertEqual(c.json(), {"ok": True, "ctxUpdated": True})
-        self.assertEqual(llm_proxy.token_meta(tok)["ctx"]["contact"], "+919876543210")
-        self.assertEqual(llm_proxy.token_meta(tok)["ctx"]["assignmentCode"], "ABC234")
+        self.assertEqual(prep.agent_ctx["contact"], "+919876543210")
+        self.assertEqual(prep.agent_ctx["assignmentCode"], "ABC234")
 
-    def test_no_public_url_means_not_tool_enabled(self):
-        r, joins = self.start({"caseId": "teacher", "systemPrompt": "Iyer", "initialLine": "Hello", "gender": "F"}, public=False)
+    def test_teacher_start_tools_enabled(self):
+        r = self.start({"caseId": "teacher", "systemPrompt": "Iyer", "initialLine": "Hello", "gender": "F"})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertFalse(r.json()["toolsEnabled"])
-        self.assertNotEqual(joins[0]["properties"]["llm"].get("vendor"), "custom")
+        data = r.json()
+        self.assertTrue(data["toolsEnabled"])
+        prep = gemini_live.get_prepared_session(data["channel"])
+        self.assertIsNotNone(prep)
+        self.assertEqual(prep.agent_kind, "teacher")
 
     def test_patient_start_unchanged(self):
-        r, joins = self.start({"caseId": "im-001", "systemPrompt": "p", "initialLine": "hi", "gender": "M",
-                               "agentContext": {"x": 1}})
-        self.assertNotIn("toolsEnabled", r.json())
-        self.assertIsNone(llm_proxy.token_meta(joins[0]["properties"]["llm"]["api_key"]))
+        r = self.start({"caseId": "im-001", "systemPrompt": "p", "initialLine": "hi", "gender": "M",
+                        "agentContext": {"x": 1}})
+        self.assertEqual(r.status_code, 200)
+        prep = gemini_live.get_prepared_session(r.json()["channel"])
+        self.assertIsNotNone(prep)
+        self.assertIsNone(prep.agent_kind)
 
     def test_oversized_ctx_rejected(self):
-        r, _ = self.start({"caseId": "viva-examiner", "systemPrompt": "p", "initialLine": "hi", "gender": "M",
-                           "agentContext": {"plan": [{"q": "x" * 400, "difficulty": 1}] * 40}})
+        r = self.start({"caseId": "viva-examiner", "systemPrompt": "p", "initialLine": "hi", "gender": "M",
+                        "agentContext": {"plan": [{"q": "x" * 400, "difficulty": 1}] * 40}})
         self.assertEqual(r.status_code, 422)
 
 

@@ -2,23 +2,22 @@
  * Student side of the live faculty observer.
  *
  * `inviteObserver()` asks the backend for an invite code on the live voice
- * channel and logs a separate RTM identity (the "link" uid) into that
- * channel. The link, not the voice `Conversation`, owns observer traffic so
+ * channel and connects a separate native WebSocket identity (the "link" uid)
+ * to /voice/observer/ws?channel={channel}&uid={uid}&token={token}.
+ *
+ * The link, not the voice `Conversation`, owns observer traffic so
  * whispers and marks still arrive after the call ends (OSCE marks are
  * usually given at the bell). It:
  *   - publishes `medsim.event` chart events (store diff, batched) to the channel,
- *   - answers `medsim.hello` with a `medsim.snapshot` (USER message to that observer),
- *   - receives `medsim.whisper` / `medsim.marks`, shows them, acks them.
- * The link lives until "Stop sharing", a new invite, the code's expiry, or
- * page unload.
+ *   - answers `medsim.hello` with a `medsim.snapshot`,
+ *   - receives `medsim.whisper` / `medsim.marks`, shows them, acks them,
+ *   - forwards live 16kHz student PCM (prefix 0x01) and 24kHz agent PCM (prefix 0x02) to observers.
  */
 
-import AgoraRTM, { type RTMClient } from 'agora-rtm';
 import { useSyncExternalStore } from 'react';
 import { POLYCLINIC_BED_INDEX, store } from '../game/store';
 import type { GameState } from '../game/types';
 import { getExistingConversation, getLastTranscript } from '../voice/conversationStore';
-import { decodeRtmJson } from '../voice/transcriptParser';
 import { testById } from '../data/tests';
 import { medicationById } from '../data/medications';
 import { POLYCLINIC_DIAGNOSIS_LABELS } from '../data/polyclinicPatients';
@@ -40,7 +39,6 @@ const LOG = '[medsim:observer-link]';
 
 export interface FacultyToast {
   id: string;
-  /** 'call': a message an invited observer left with Asha on the phone. */
   kind: 'whisper' | 'marks' | 'call';
   text: string;
   examiner: string;
@@ -122,7 +120,7 @@ interface InviteResponse {
 }
 
 class Link {
-  private rtm: RTMClient | null = null;
+  private ws: WebSocket | null = null;
   private unsubStore: (() => void) | null = null;
   private prev: ChartSlice;
   private pending: ChartEvent[] = [];
@@ -133,7 +131,7 @@ class Link {
   readonly selfUid: string;
 
   constructor(
-    private appId: string,
+    _appId: string,
     private channel: string,
     private caseId: string,
     private encounterAt: number,
@@ -146,27 +144,101 @@ class Link {
     this.expiryTimer = window.setTimeout(() => stopObserverLink(), Math.max(1000, expiresAt - Date.now()));
   }
 
-  async start() {
-    const rtm = new AgoraRTM.RTM(this.appId, this.selfUid);
-    this.rtm = rtm;
-    rtm.addEventListener('message', (ev) => {
-      if (ev.channelType !== 'USER' && ev.channelName !== this.channel) return;
-      if (String(ev.publisher) === this.selfUid) return;
-      const m = parseMedsimMessage(decodeRtmJson(ev.message));
-      if (m && isForMe(m, this.selfUid, ev.channelType)) this.onMessage(m, String(ev.publisher));
+  async start(): Promise<void> {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.host;
+    const url = `${proto}//${host}/voice/observer/ws?channel=${encodeURIComponent(this.channel)}&uid=${encodeURIComponent(this.selfUid)}&token=${encodeURIComponent(this.creds.token)}`;
+
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    this.ws = ws;
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = window.setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error('Observer link connection timed out.'));
+        }
+      }, 10000);
+
+      ws.onopen = () => {
+        if (!settled) {
+          settled = true;
+          window.clearTimeout(timer);
+          resolve();
+        }
+      };
+
+      ws.onerror = () => {
+        if (!settled) {
+          settled = true;
+          window.clearTimeout(timer);
+          reject(new Error('Observer link connection failed.'));
+        }
+      };
     });
-    rtm.addEventListener('presence', (ev) => {
-      if (ev.channelName !== this.channel) return;
-      if (ev.eventType === 'REMOTE_LEAVE' || ev.eventType === 'REMOTE_TIMEOUT') {
-        const who = String(ev.publisher);
-        if (state.observers.includes(who)) setState({ observers: state.observers.filter((o) => o !== who) });
+
+    if (this.closed) {
+      try { ws.close(); } catch { /* noop */ }
+      return;
+    }
+
+    ws.onmessage = (ev: MessageEvent) => {
+      if (typeof ev.data !== 'string') return;
+      try {
+        const obj = JSON.parse(ev.data);
+        if (!obj || typeof obj !== 'object') return;
+
+        // Presence events
+        if (obj.eventType === 'REMOTE_LEAVE' || obj.eventType === 'REMOTE_TIMEOUT') {
+          const who = String(obj.publisher || obj.userId || obj.from || '');
+          if (who && state.observers.includes(who)) {
+            setState({ observers: state.observers.filter((o) => o !== who) });
+          }
+          return;
+        }
+
+        const from = String(obj.publisher || obj.from || obj.userId || '');
+        if (from === this.selfUid) return;
+
+        const m = parseMedsimMessage(obj);
+        if (m && isForMe(m, this.selfUid, 'USER')) {
+          this.onMessage(m, from);
+        }
+      } catch {
+        /* noop */
       }
-    });
-    await rtm.login({ token: this.creds.token });
-    if (this.closed) return void rtm.logout().catch(() => undefined);
-    await rtm.subscribe(this.channel, { withMessage: true, withPresence: true });
-    if (this.closed) return void rtm.logout().catch(() => undefined);
+    };
+
+    ws.onclose = () => {
+      if (!this.closed) {
+        this.close();
+      }
+    };
+
     this.unsubStore = store.subscribe(() => this.onStore());
+  }
+
+  sendAudio(prefix: number, pcm: ArrayBuffer): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const tagged = new Uint8Array(pcm.byteLength + 1);
+    tagged[0] = prefix;
+    tagged.set(new Uint8Array(pcm), 1);
+    try {
+      this.ws.send(tagged.buffer);
+    } catch {
+      /* noop */
+    }
+  }
+
+  sendTranscript(msg: Record<string, unknown>): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify(msg));
+    } catch {
+      /* noop */
+    }
   }
 
   private onStore() {
@@ -193,19 +265,20 @@ class Link {
   }
 
   private async publishChannel(m: MedsimMessage) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     try {
-      await this.rtm?.publish(this.channel, encodeMedsim(m), { customType: m.object });
+      this.ws.send(encodeMedsim(m));
     } catch (err) {
       console.warn(LOG, 'channel publish failed:', err);
     }
   }
 
   private async publishTo(uid: string, m: MedsimMessage) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     try {
-      await this.rtm?.publish(uid, encodeMedsim(m), { channelType: 'USER', customType: m.object });
-    } catch {
-      // USER messages can fail across regions/plans; a targeted channel message still reaches them.
-      await this.publishChannel({ ...m, to: uid } as MedsimMessage);
+      this.ws.send(encodeMedsim({ ...m, to: uid } as unknown as MedsimMessage));
+    } catch (err) {
+      console.warn(LOG, 'publishTo failed:', err);
     }
   }
 
@@ -256,9 +329,15 @@ class Link {
     if (this.expiryTimer !== null) window.clearTimeout(this.expiryTimer);
     this.unsubStore?.();
     this.unsubStore = null;
-    const rtm = this.rtm;
-    this.rtm = null;
-    if (rtm) rtm.logout().catch(() => undefined);
+    if (this.ws) {
+      const ws = this.ws;
+      this.ws = null;
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      try { ws.close(); } catch { /* noop */ }
+    }
   }
 }
 
@@ -279,6 +358,21 @@ export function stopObserverLink() {
   link?.close();
   link = null;
   setState({ ...IDLE, toasts: state.toasts });
+}
+
+/** Forward live student 16kHz PCM audio chunk to active observer link. */
+export function forwardStudentAudio(chunk: ArrayBuffer): void {
+  link?.sendAudio(0x01, chunk);
+}
+
+/** Forward live agent 24kHz PCM audio chunk to active observer link. */
+export function forwardAgentAudio(chunk: ArrayBuffer): void {
+  link?.sendAudio(0x02, chunk);
+}
+
+/** Forward live transcript / agent JSON event frame to active observer link. */
+export function forwardLiveTranscript(msg: Record<string, unknown>): void {
+  link?.sendTranscript(msg);
 }
 
 /** Mint an invite for the live voice call and start the link. */
@@ -313,7 +407,6 @@ export async function inviteObserver(): Promise<void> {
     }
     await next.start();
     if (link !== next) return;
-    // The observer opens the same site the student is on (the backend may sit behind a proxy).
     const url = `${window.location.origin}/?observe=${encodeURIComponent(inv.code)}`;
     setState({
       status: 'live',

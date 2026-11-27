@@ -154,7 +154,7 @@ class RouterTests(unittest.TestCase):
         self.assertIn(b'filename="medsim-report-gm-01.pdf"', doc)
         self.assertIn(b"application/pdf", doc)
         self.assertIn(b"%PDF-1.4", doc)
-        self.assertIn(b"audio/mpeg", self.calls[3][1].content)
+        self.assertIn(b"audio/wav", self.calls[3][1].content)
 
     def test_default_destination_and_audio_skipped(self):
         data = self.client.post("/agent/results/send", json=payload(to=None)).json()

@@ -9,10 +9,12 @@ import { verifyTriagePriority } from './triage-priority.ts';
 import { verifyThreeScene } from './three-scene.ts';
 import { verifyRubricCitations } from './rubric-smoke.ts';
 import { verifyClinicalConsistency } from './clinical-consistency.ts';
+import { verifyBranchGuard } from './branch-guard.ts';
 
 type Violation = { case: string; rule: string; detail: string };
 
 const checks: Array<{ name: string; run: () => Violation[] }> = [
+  { name: 'branch-guard', run: verifyBranchGuard },
   { name: 'data-integrity', run: verifyDataIntegrity },
   { name: 'triage-priority', run: verifyTriagePriority },
   { name: 'three-scene', run: verifyThreeScene },

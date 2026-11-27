@@ -1,6 +1,6 @@
 """POST /teach/lesson: a short whiteboard lesson for the Teacher Portal.
 
-The LLM (Sarvam first, Groq fallback, via llm_provider.chat) writes a lesson
+The LLM powered by Gemini (via llm_provider.chat) writes a lesson
 as strict JSON. We validate and normalise it here so the frontend whiteboard
 renderer can trust the shape:
 
@@ -414,7 +414,15 @@ async def _generate(topic: str, level: str, lang: Optional[str] = None) -> dict[
     async with httpx.AsyncClient(timeout=ATTEMPT_TIMEOUT_S) as client:
         for attempt in range(2):
             msg, provider = await asyncio.wait_for(
-                chat(messages, json_mode=True, max_tokens=2400, temperature=0.4, client=client),
+                chat(
+                    messages,
+                    json_mode=True,
+                    max_tokens=2400,
+                    temperature=0.4,
+                    client=client,
+                    tier="reasoning",
+                    effort="medium",
+                ),
                 timeout=ATTEMPT_TIMEOUT_S * 1.5,
             )
             content = msg.get("content") or ""
@@ -489,7 +497,16 @@ async def teach_ask(req: AskRequest):
     system = langmod.with_language(req.system + " " + ASK_STYLE, req.lang, female=True, role="teacher")
     msgs = [{"role": "system", "content": system}] + [m.model_dump() for m in req.messages[-12:]]
     try:
-        msg, _ = await asyncio.wait_for(chat(msgs, max_tokens=220, temperature=0.6), timeout=ATTEMPT_TIMEOUT_S * 1.5)
+        msg, _ = await asyncio.wait_for(
+            chat(
+                msgs,
+                max_tokens=220,
+                temperature=0.6,
+                tier="reasoning",
+                effort="medium",
+            ),
+            timeout=ATTEMPT_TIMEOUT_S * 1.5,
+        )
         text = re.sub(r"[*_`#]+", "", strip_think(msg.get("content") or "")).strip()
     except Exception as e:  # noqa: BLE001 - provider down, timeout, bad body
         log.warning("teach/ask failed: %s", type(e).__name__)

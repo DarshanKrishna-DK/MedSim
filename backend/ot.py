@@ -6,7 +6,7 @@
 The drill itself (timeline, vitals, judging, scoring) runs client-side and is
 deterministic (src/ot/engine.ts). This endpoint only turns the textbook
 teaching point into two or three spoken sentences from the consultant
-anaesthetist, via llm_provider.chat (Sarvam first, Groq fallback). If the
+anaesthetist, via llm_provider.chat powered by Gemini. If the
 model is unavailable, slow or empty, it answers with the textbook teaching
 point itself, so it always returns something. Synthetic training content only.
 """
@@ -118,6 +118,8 @@ async def ot_explain(req: ExplainRequest) -> ExplainResponse:
                 json_mode=True,
                 max_tokens=260,
                 temperature=0.2,
+                tier="fast",
+                effort="low",
             ),
             timeout=LLM_TIMEOUT_S,
         )

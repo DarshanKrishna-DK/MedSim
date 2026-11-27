@@ -4,7 +4,7 @@
 (allergy conflict, contraindication, dangerous dose, missed red flag,
 prescribing before any history, a harmful or irrelevant test, anchoring on a
 wrong diagnosis). Two cheap deterministic rules run first; everything else
-goes to the OpenAI-compatible provider (Sarvam first, Groq fallback) in JSON
+goes to the OpenAI-compatible provider powered by Gemini in JSON
 mode with a short timeout. Any failure degrades to "no alert": the coach is
 advisory and must never block the encounter. Keys are never logged.
 """
@@ -388,7 +388,14 @@ async def _llm(messages: list[dict[str, Any]], *, json_mode: bool, max_tokens: i
     """One bounded LLM call. Returns content, or None on any failure/timeout."""
     try:
         msg, _ = await asyncio.wait_for(
-            chat(messages, json_mode=json_mode, max_tokens=max_tokens, temperature=0.1),
+            chat(
+                messages,
+                json_mode=json_mode,
+                max_tokens=max_tokens,
+                temperature=0.1,
+                tier="reasoning",
+                effort="medium",
+            ),
             timeout=COACH_TIMEOUT_S,
         )
     except asyncio.TimeoutError:

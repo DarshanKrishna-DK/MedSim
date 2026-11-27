@@ -129,7 +129,7 @@ class TwilioTests(Base):
 class EmailTests(Base):
     def test_email_sends_attachments(self):
         with mock.patch.dict(os.environ, SMTP), mock.patch.object(notify.smtplib, "SMTP_SSL") as ssl_cls:
-            r = run(notify.send_to_patient("email", "d@gmail.com", "body", None, b"MP3DATA", b"BEGIN:VCALENDAR"))
+            r = run(notify.send_to_patient("email", "d@gmail.com", "body", None, b"RIFFWAVDATA", b"BEGIN:VCALENDAR"))
         self.assertTrue(r["ok"], r)
         self.assertEqual(r["to"], "d***@gmail.com")
         self.assertTrue(r["messageId"])
@@ -139,7 +139,7 @@ class EmailTests(Base):
         smtp.login.assert_called_once_with("doc@gmail.com", "pw")
         msg = smtp.send_message.call_args.args[0]
         names = [p.get_filename() for p in msg.iter_attachments()]
-        self.assertEqual(names, ["prescription.mp3", "follow-up.ics"])
+        self.assertEqual(names, ["prescription.wav", "follow-up.ics"])
         self.assertEqual(msg["To"], "d@gmail.com")
 
     def test_email_failure_is_contained(self):

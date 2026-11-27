@@ -1,4 +1,4 @@
-import type { IRemoteVideoTrack } from 'agora-rtc-sdk-ng';
+import type { AvatarTrack } from '../AvatarVideo';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Conversation, type ConversationStatus, type SubtitleEvent } from '../../voice/conversation';
 import { ensureAudioContext } from '../../voice/conversationStore';
@@ -11,7 +11,7 @@ import type { AgentEvent } from '../../agents/agentEvents';
 // The classroom's teacher voice session. Reuses the patient voice stack as
 // is: a Conversation (POST /voice/start with caseId 'teacher'), then
 // /voice/context to ground it in the lesson and /voice/speak for each
-// whiteboard step's narration. Typed questions go over RTM when live, or
+// whiteboard step's narration. Typed questions go over WebSocket when live, or
 // to POST /teach/ask when voice is off.
 // When the session is tool-enabled, Dr. Iyer decides herself, mid-call, to
 // draw on the board, pop a quiz, assign practice or book a revision
@@ -95,7 +95,7 @@ export function useTeacherSession(opts: {
   const [log, setLog] = useState<ClassLine[]>([]);
   const [micMuted, setMicMuted] = useState(false);
   const [thinking, setThinking] = useState(false);
-  const [avatarTrack, setAvatarTrack] = useState<IRemoteVideoTrack | null>(null);
+  const [avatarTrack, setAvatarTrack] = useState<AvatarTrack | null>(null);
 
   const convRef = useRef<Conversation | null>(null);
   const promptRef = useRef(buildTeacherPersona(store.getState().lang));

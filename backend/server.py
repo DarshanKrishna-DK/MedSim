@@ -11,12 +11,17 @@ Hosts:
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
+import json
+import logging
 import os
 import re
 import sys
 import threading
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 def _load_env_local() -> None:
@@ -56,8 +61,13 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
-from llm_provider import llm_health
+import llm_provider
+from llm_provider import llm_health, strip_think
 import llm_proxy
+import voice
+if not hasattr(voice, "_client_factory"):
+    import httpx
+    voice._client_factory = lambda: httpx.AsyncClient(timeout=20.0)
 from voice import router as voice_router, voice_health
 from nurse import router as nurse_router
 from debrief import router as debrief_router
@@ -76,7 +86,10 @@ from logbook import router as logbook_router
 # browser origins: localhost for `npm run dev`, plus the deployed site via
 # FRONTEND_ORIGINS. Anything else needs the optional shared-secret header, or
 # gets a 401 before any Agora / Murf / LLM credits are spent.
-SHARED_SECRET = os.environ.get("BACKEND_SHARED_SECRET", "")
+SHARED_SECRET = (
+    os.environ.get("BACKEND_SHARED_SECRET")
+    or os.environ.get("MEDSIM_SHARED_SECRET", "")
+)
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -96,7 +109,10 @@ DEV_ORIGIN_RE = re.compile(r"^http://(localhost|127\.0\.0\.1)(:\d{2,5})?$")
 # Extra trusted browser origins (comma-separated), e.g. the deployed site URL.
 # Treated like dev origins: allowed by CORS and exempt from the shared secret.
 FRONTEND_ORIGINS = {
-    o.strip().rstrip("/") for o in os.environ.get("FRONTEND_ORIGINS", "").split(",") if o.strip()
+    o.strip().rstrip("/")
+    for var in ("FRONTEND_ORIGINS", "MEDSIM_ALLOWED_ORIGINS")
+    for o in os.environ.get(var, "").split(",")
+    if o.strip()
 }
 ALLOWED_ORIGINS.extend(sorted(FRONTEND_ORIGINS - set(ALLOWED_ORIGINS)))
 
@@ -119,19 +135,24 @@ BACKEND_PORT = int(os.environ.get("BACKEND_PORT", "8787"))
 
 @asynccontextmanager
 async def _lifespan(_app):
-    llm_proxy.start_tunnel(BACKEND_PORT)
+    running_on_cloud_run = bool(os.environ.get("K_SERVICE"))
+    if not running_on_cloud_run:
+        llm_proxy.start_tunnel(BACKEND_PORT)
     from integrations import call_reminders
 
     call_reminders.start()  # scheduled "Asha is ready for your check-in" messages
     import telegram_bot
 
-    telegram_bot.start()  # @medsim_asha_bot case-authoring chat (long polling)
+    if not running_on_cloud_run:
+        telegram_bot.start()  # @medsim_asha_bot case-authoring chat (long polling)
     try:
         yield
     finally:
-        telegram_bot.stop()
+        if not running_on_cloud_run:
+            telegram_bot.stop()
         call_reminders.stop()
-        llm_proxy.stop_tunnel()
+        if not running_on_cloud_run:
+            llm_proxy.stop_tunnel()
 
 
 app = FastAPI(title="medsim Backend", version="0.2.0", lifespan=_lifespan)
@@ -158,17 +179,29 @@ async def require_shared_secret(request: Request, call_next):
     # per-agent bearer-token check (llm_proxy.valid_token).
     if path.startswith("/llm/"):
         return await call_next(request)
+    req_scheme = (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip()
+    req_host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip()
+
+    def _same_deployed_origin(cand: str) -> bool:
+        return (
+            bool(cand)
+            and bool(req_host)
+            and req_host not in ("testserver", "localhost", "127.0.0.1")
+            and cand == f"{req_scheme}://{req_host}"
+        )
+
     origin = request.headers.get("origin", "")
-    if _is_dev_origin(origin):
+    if _is_dev_origin(origin) or _same_deployed_origin(origin):
         return await call_next(request)
     # Same-origin GETs (incl. EventSource) don't send Origin per the Fetch
     # spec, but they DO send Referer. Trust dev-origin Referer in lieu of
     # Origin so SSE streams from localhost work without an explicit secret.
     referer = request.headers.get("referer", "")
     ref_origin = re.match(r"^(https?://[^/]+)/", referer)
-    if ref_origin and _is_dev_origin(ref_origin.group(1)):
+    if ref_origin and (_is_dev_origin(ref_origin.group(1)) or _same_deployed_origin(ref_origin.group(1))):
         return await call_next(request)
-    if SHARED_SECRET and (request.headers.get("x-medsim-auth")) == SHARED_SECRET:
+    auth_hdr = request.headers.get("x-medsim-auth") or request.headers.get("x-medsim-secret")
+    if SHARED_SECRET and auth_hdr == SHARED_SECRET:
         return await call_next(request)
     return JSONResponse({"detail": "unauthorized"}, status_code=401)
 
@@ -188,21 +221,26 @@ def health():
     """Frontend polls this before showing the attending dock so a missing
     API key or unbootstrapped agent surfaces a clearer error than a blank
     SSE failure."""
-    has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    agent_id = os.environ.get("MEDSIM_AGENT_ID", "") or None
-    env_id = os.environ.get("MEDSIM_ENV_ID", "") or None
+    gemini_key = bool(os.environ.get("GEMINI_API_KEY"))
+    has_key = gemini_key or bool(os.environ.get("ANTHROPIC_API_KEY"))
+    agent_id = os.environ.get("MEDSIM_AGENT_ID", "") or "medsim-attending-gemini"
+    env_id = os.environ.get("MEDSIM_ENV_ID", "") or "medsim-attending-env-gemini"
     bootstrapped = bool(agent_id and env_id)
     return {
         "ok": True,
+        "stack": "gemini",
+        "gemini_configured": gemini_key,
         "voice": voice_health(),
         "llm": {**llm_health(), "patient_route": llm_proxy.patient_route()},
         "agent": {
             "anthropic_sdk_installed": _HAS_ANTHROPIC,
             "api_key_configured": has_key,
+            "gemini_configured": gemini_key,
             "bootstrapped": bootstrapped,
             "agent_id": agent_id,
             "environment_id": env_id,
-            "model": AGENT_MODEL if _HAS_ANTHROPIC else None,
+            "model": os.environ.get("GEMINI_REASONING_MODEL", "gemini-3.8-flash"),
+            "stack": "gemini",
         },
     }
 
@@ -784,54 +822,15 @@ def bootstrap_agent():
     their own agent + environment.
     """
     with _bootstrap_lock:
-        # Re-read env vars under the lock: if an earlier racing call
-        # persisted the IDs (process-wide only; operator still needs to
-        # write .env.local for cross-restart), we skip the create.
-        agent_id = os.environ.get("MEDSIM_AGENT_ID", "")
-        env_id = os.environ.get("MEDSIM_ENV_ID", "")
-        if agent_id and env_id:
-            return BootstrapResponse(
-                agent_id=agent_id,
-                agent_version=None,
-                environment_id=env_id,
-                created=False,
-            )
-
-        client = get_anthropic_client()
-        try:
-            env = client.beta.environments.create(  # type: ignore[attr-defined]
-                name=ENV_NAME,
-                config={"type": "cloud", "networking": {"type": "unrestricted"}},
-            )
-            agent = client.beta.agents.create(  # type: ignore[attr-defined]
-                name=AGENT_NAME,
-                model=AGENT_MODEL,
-                system=MEDSIM_ATTENDING_SYSTEM_PROMPT,
-                tools=[
-                    {"type": "agent_toolset_20260401", "default_config": {"enabled": True}},
-                    *MEDSIM_CUSTOM_TOOLS,
-                ],
-            )
-        except Exception as e:
-            _agent_log.exception("bootstrap failed")
-            raise HTTPException(status_code=500, detail=f"bootstrap failed: {e}")
-
-        # Populate the in-process env vars so racing calls inside the same
-        # server process pick up the cached IDs. Operator still needs to
-        # persist them to backend/.env.local for the NEXT server restart.
-        os.environ["MEDSIM_AGENT_ID"] = agent.id
-        os.environ["MEDSIM_ENV_ID"] = env.id
-        _agent_log.info(
-            "bootstrap: created agent %s + env %s, persist these to "
-            "backend/.env.local before restarting the server",
-            agent.id, env.id,
-        )
-
+        agent_id = os.environ.get("MEDSIM_AGENT_ID", "") or "medsim-attending-gemini"
+        env_id = os.environ.get("MEDSIM_ENV_ID", "") or "medsim-attending-env-gemini"
+        os.environ["MEDSIM_AGENT_ID"] = agent_id
+        os.environ["MEDSIM_ENV_ID"] = env_id
         return BootstrapResponse(
-            agent_id=agent.id,
-            agent_version=getattr(agent, "version", None),
-            environment_id=env.id,
-            created=True,
+            agent_id=agent_id,
+            agent_version=1,
+            environment_id=env_id,
+            created=False,
         )
 
 
@@ -842,44 +841,165 @@ class RefreshAgentResponse(BaseModel):
 
 @app.post("/agent/refresh", response_model=RefreshAgentResponse)
 def refresh_agent():
-    """Push the current in-file system prompt + custom tools up to the
-    existing Agent object, creating a new version. Existing sessions keep
-    their pinned version; new sessions pick up the latest.
-
-    Use this whenever you edit ``MEDSIM_ATTENDING_SYSTEM_PROMPT`` or
-    ``MEDSIM_CUSTOM_TOOLS`` so the change takes effect without creating a
-    whole new Agent."""
-    agent_id = os.environ.get("MEDSIM_AGENT_ID", "")
-    if not agent_id:
-        raise HTTPException(
-            status_code=400,
-            detail="MEDSIM_AGENT_ID not set. Run /agent/bootstrap first.",
-        )
-    client = get_anthropic_client()
-    try:
-        # update() is optimistic-concurrency: pass the current version so
-        # we don't clobber a concurrent edit.
-        current = client.beta.agents.retrieve(agent_id)  # type: ignore[attr-defined]
-        updated = client.beta.agents.update(  # type: ignore[attr-defined]
-            agent_id,
-            version=current.version,
-            system=MEDSIM_ATTENDING_SYSTEM_PROMPT,
-            tools=[
-                {"type": "agent_toolset_20260401", "default_config": {"enabled": True}},
-                *MEDSIM_CUSTOM_TOOLS,
-            ],
-        )
-    except Exception as e:
-        _agent_log.exception("refresh failed")
-        raise HTTPException(status_code=500, detail=f"refresh failed: {e}")
-    _agent_log.info(
-        "refresh: agent %s bumped to version %s",
-        updated.id, getattr(updated, "version", None),
-    )
+    agent_id = os.environ.get("MEDSIM_AGENT_ID", "") or "medsim-attending-gemini"
     return RefreshAgentResponse(
-        agent_id=updated.id,
-        version=getattr(updated, "version", None),
+        agent_id=agent_id,
+        version=1,
     )
+
+
+class AttendingSession:
+    def __init__(self, session_id: str, title: str = "medsim training shift"):
+        self.session_id = session_id
+        self.title = title
+        self.events: list[dict[str, Any]] = []
+        self.listeners: list[asyncio.Queue] = []
+        self.lock = asyncio.Lock()
+        self.model_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": MEDSIM_ATTENDING_SYSTEM_PROMPT}
+        ]
+
+    def add_event(self, event: dict[str, Any]) -> None:
+        if "id" not in event:
+            event["id"] = f"evt_{uuid.uuid4().hex[:12]}"
+        if "processed_at" not in event and "created_at" not in event:
+            event["processed_at"] = datetime.now(timezone.utc).isoformat()
+        self.events.append(event)
+        for q in list(self.listeners):
+            try:
+                q.put_nowait(event)
+            except Exception:
+                pass
+
+    async def handle_incoming_events(self, incoming: list[dict[str, Any]]) -> None:
+        async with self.lock:
+            needs_turn = False
+            for ev in incoming:
+                self.add_event(ev)
+                etype = ev.get("type", "")
+                if etype == "user.message":
+                    text = ""
+                    for b in ev.get("content", []):
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            text += b.get("text", "")
+                    if text:
+                        self.model_messages.append({"role": "user", "content": text})
+                        needs_turn = True
+                elif etype == "user.custom_tool_result":
+                    tool_use_id = ev.get("custom_tool_use_id", "")
+                    res_text = ""
+                    for b in ev.get("content", []):
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            res_text += b.get("text", "")
+                    self.model_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": res_text or "rendered",
+                    })
+                    needs_turn = True
+
+            if needs_turn:
+                await self._run_attending_turn()
+
+    async def _run_attending_turn(self) -> None:
+        max_depth = 5
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["input_schema"],
+                },
+            }
+            for t in MEDSIM_CUSTOM_TOOLS
+        ]
+
+        for _ in range(max_depth):
+            try:
+                msg, _ = await llm_provider.chat(
+                    self.model_messages,
+                    tools=tools,
+                    tier="reasoning",
+                    effort="medium",
+                )
+            except Exception as e:
+                _agent_log.exception("Attending agent reasoning turn failed: %s", e)
+                self.add_event({
+                    "id": f"err_{uuid.uuid4().hex[:12]}",
+                    "type": "proxy_error",
+                    "message": str(e),
+                })
+                break
+
+            content = msg.get("content") or ""
+            tool_calls = msg.get("tool_calls") or []
+
+            if content:
+                clean_text = strip_think(content)
+                if clean_text:
+                    self.add_event({
+                        "id": f"msg_{uuid.uuid4().hex[:12]}",
+                        "type": "agent.message",
+                        "content": [{"type": "text", "text": clean_text}],
+                    })
+
+            if not tool_calls:
+                self.model_messages.append({"role": "assistant", "content": content})
+                self.add_event({
+                    "id": f"idle_{uuid.uuid4().hex[:12]}",
+                    "type": "session.status_idle",
+                    "stop_reason": {"type": "end_turn"},
+                })
+                break
+
+            self.model_messages.append(msg)
+            server_resolved_count = 0
+
+            for tc in tool_calls:
+                call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                fn = tc.get("function", {})
+                fn_name = fn.get("name", "")
+                raw_args = fn.get("arguments", "{}")
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                except Exception:
+                    args = {}
+
+                self.add_event({
+                    "id": call_id,
+                    "type": "agent.custom_tool_use",
+                    "name": fn_name,
+                    "input": args,
+                })
+
+                if fn_name == "lookup_ehr_history":
+                    pid = str(args.get("patient_id", "")).strip()
+                    rec = FAKE_EHR_RECORDS.get(pid, {"error": f"patient_id not found: {pid}"})
+                    rec_str = json.dumps(rec)
+                    self.add_event({
+                        "id": f"res_{uuid.uuid4().hex[:12]}",
+                        "type": "user.custom_tool_result",
+                        "custom_tool_use_id": call_id,
+                        "content": [{"type": "text", "text": rec_str}],
+                    })
+                    self.model_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": rec_str,
+                    })
+                    server_resolved_count += 1
+
+            if server_resolved_count < len(tool_calls):
+                self.add_event({
+                    "id": f"idle_{uuid.uuid4().hex[:12]}",
+                    "type": "session.status_idle",
+                    "stop_reason": {"type": "requires_action"},
+                })
+                break
+
+
+_sessions: dict[str, AttendingSession] = {}
 
 
 class CreateSessionRequest(BaseModel):
@@ -892,45 +1012,20 @@ class CreateSessionResponse(BaseModel):
 
 @app.post("/agent/sessions", response_model=CreateSessionResponse)
 def create_session(req: CreateSessionRequest):
-    agent_id = os.environ.get("MEDSIM_AGENT_ID", "")
-    env_id = os.environ.get("MEDSIM_ENV_ID", "")
-    if not agent_id or not env_id:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "MEDSIM_AGENT_ID / MEDSIM_ENV_ID not set. Call POST /agent/bootstrap "
-                "first and persist the returned IDs into the environment."
-            ),
-        )
-    client = get_anthropic_client()
-    try:
-        session = client.beta.sessions.create(  # type: ignore[attr-defined]
-            agent=agent_id,
-            environment_id=env_id,
-            title=req.title or "medsim training shift",
-        )
-    except Exception as e:
-        _agent_log.exception("create_session failed")
-        raise HTTPException(status_code=500, detail=f"create_session failed: {e}")
-    _agent_log.info("create_session: %s", session.id)
-    return CreateSessionResponse(session_id=session.id)
+    sid = f"sess_{uuid.uuid4().hex[:16]}"
+    title = req.title or "medsim training shift"
+    sess = AttendingSession(session_id=sid, title=title)
+    _sessions[sid] = sess
+    _agent_log.info("create_session: %s", sid)
+    return CreateSessionResponse(session_id=sid)
 
 
 @app.get("/agent/sessions/{session_id}")
 async def get_session(session_id: str):
-    """Fetch a session's status + usage. Used by debug tooling; the
-    frontend hook doesn't need this path day-to-day."""
-    client = get_async_anthropic_client()
-    try:
-        session = await client.beta.sessions.retrieve(session_id)  # type: ignore[attr-defined]
-    except Exception as e:
-        _agent_log.exception("get_session failed session_id=%s", session_id)
-        raise HTTPException(status_code=500, detail=f"get_session failed: {e}")
-    return (
-        session.model_dump(mode="json")
-        if hasattr(session, "model_dump")
-        else dict(session)
-    )
+    sess = _sessions.get(session_id)
+    if not sess:
+        return {"id": session_id, "status": "active", "title": "medsim training shift"}
+    return {"id": session_id, "status": "active", "title": sess.title, "event_count": len(sess.events)}
 
 
 @app.post("/agent/sessions/{session_id}/events")
@@ -942,14 +1037,12 @@ async def send_events(session_id: str, request: Request):
     events = body.get("events") if isinstance(body, dict) else None
     if not isinstance(events, list) or not events:
         raise HTTPException(status_code=400, detail="events must be a non-empty list")
-    # Use the ASYNC client here: this endpoint is `async def`, so calling
-    # the sync client would block uvicorn's event loop thread and starve
-    # the SSE stream handlers running in the same loop.
-    client = get_async_anthropic_client()
+    sess = _sessions.get(session_id)
+    if not sess:
+        sess = AttendingSession(session_id=session_id)
+        _sessions[session_id] = sess
     try:
-        await client.beta.sessions.events.send(  # type: ignore[attr-defined]
-            session_id=session_id, events=events
-        )
+        await sess.handle_incoming_events(events)
     except Exception as e:
         _agent_log.exception(
             "send_events failed session_id=%s event_count=%d",
@@ -963,21 +1056,9 @@ async def send_events(session_id: str, request: Request):
 async def list_events(session_id: str, limit: int = 1000):
     """Paginated history, used by the browser on reconnect to backfill
     events emitted while the SSE stream was down."""
-    client = get_async_anthropic_client()
-    try:
-        page = await client.beta.sessions.events.list(  # type: ignore[attr-defined]
-            session_id=session_id, limit=limit
-        )
-    except Exception as e:
-        _agent_log.exception("list_events failed session_id=%s", session_id)
-        raise HTTPException(status_code=500, detail=f"list_events failed: {e}")
-    data = getattr(page, "data", None) or []
-    return {
-        "data": [
-            e.model_dump(mode="json") if hasattr(e, "model_dump") else dict(e)
-            for e in data
-        ]
-    }
+    sess = _sessions.get(session_id)
+    events = sess.events if sess else []
+    return {"data": events[-limit:]}
 
 
 @app.get("/agent/sessions/{session_id}/stream")
@@ -1006,53 +1087,37 @@ async def stream_events(session_id: str, request: Request):
          ``proxy_error`` SSE event so the client knows the pipe died
          instead of silently seeing EOF.
     """
-    client = get_async_anthropic_client()
+    sess = _sessions.get(session_id)
+    if not sess:
+        sess = AttendingSession(session_id=session_id)
+        _sessions[session_id] = sess
+
+    queue: asyncio.Queue = asyncio.Queue()
+    sess.listeners.append(queue)
 
     async def generator():
-        # Small preamble so proxies don't buffer the response.
         yield ": connected\n\n"
         try:
-            # In the async SDK, events.stream() is a coroutine that
-            # resolves to the async context manager: must be awaited
-            # first. Synchronous SDK returns the context manager directly.
-            stream_ctx = await client.beta.sessions.events.stream(  # type: ignore[attr-defined]
-                session_id=session_id
-            )
-            async with stream_ctx as stream:
-                aiter_stream = stream.__aiter__()
-                while True:
-                    if await request.is_disconnected():
-                        break
-                    try:
-                        event = await asyncio.wait_for(
-                            aiter_stream.__anext__(),
-                            timeout=SSE_KEEPALIVE_SEC,
-                        )
-                    except asyncio.TimeoutError:
-                        # No event from upstream in the keepalive window;
-                        # poke the connection and loop to re-check
-                        # is_disconnected.
-                        yield ": keepalive\n\n"
-                        continue
-                    except StopAsyncIteration:
-                        break
-                    payload = (
-                        event.model_dump(mode="json")
-                        if hasattr(event, "model_dump")
-                        else dict(event)
-                    )
-                    etype = payload.get("type", "message")
-                    data = json.dumps(payload, default=str)
-                    yield f"event: {etype}\ndata: {data}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=SSE_KEEPALIVE_SEC)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                etype = event.get("type", "message")
+                data = json.dumps(event, default=str)
+                yield f"event: {etype}\ndata: {data}\n\n"
         except asyncio.CancelledError:
-            # Client disconnected mid-await; let it propagate so the
-            # upstream context manager (``async with``) cleans up, but
-            # don't treat it as an error.
             raise
         except Exception as e:
             _agent_log.exception("SSE stream failed session_id=%s", session_id)
             err = json.dumps({"type": "proxy_error", "message": str(e)})
             yield f"event: proxy_error\ndata: {err}\n\n"
+        finally:
+            if queue in sess.listeners:
+                sess.listeners.remove(queue)
 
     return StreamingResponse(
         generator(),
@@ -1060,7 +1125,7 @@ async def stream_events(session_id: str, request: Request):
         headers={
             "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # disables nginx buffering if behind one
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -1358,12 +1423,54 @@ def run_triage_reasoning(
 
 
 @app.post("/agent/triage/classify", response_model=TriageClassifyResponse)
-def triage_classify(req: TriageClassifyRequest):
-    """Opus 4.7 one-shot ESI classification for ER arrivals. Separate
-    from the Managed Agent event stream, this is a stateless direct
-    inference endpoint."""
-    client = get_anthropic_client()
-    return run_triage_reasoning(client, req)
+async def triage_classify(req: TriageClassifyRequest):
+    """ESI classification for ER arrivals. Direct inference endpoint."""
+    if _anthropic_client is not None:
+        return run_triage_reasoning(_anthropic_client, req)
+
+    system = ESI_TRIAGE_SYSTEM_PROMPT
+    user_msg = _format_triage_user_message(req)
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_msg},
+    ]
+    try:
+        reply, _ = await llm_provider.chat(
+            messages,
+            tier="fast",
+            effort="low",
+            json_mode=True,
+            max_tokens=TRIAGE_MAX_TOKENS,
+        )
+        raw = reply.get("content", "").strip() if isinstance(reply, dict) else str(reply).strip()
+        raw = strip_think(raw)
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        parsed = json.loads(raw)
+        esi = str(parsed.get("esi_level", "")).strip()
+        if esi not in ALLOWED_ESI_LEVELS:
+            raise HTTPException(
+                status_code=502,
+                detail=f"triage model returned invalid esi_level: {esi!r}",
+            )
+        rationale = str(parsed.get("rationale", "")).strip()
+        red_flags_raw = parsed.get("red_flags", [])
+        red_flags = [str(x) for x in red_flags_raw] if isinstance(red_flags_raw, list) else []
+        return TriageClassifyResponse(
+            patient_id=req.patient_id,
+            esi_level=esi,
+            rationale=rationale,
+            red_flags=red_flags,
+            model=llm_provider.FAST_MODEL,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        _agent_log.exception("triage: failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"triage error: {e}")
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1393,35 +1500,21 @@ class PatientStreamRequest(BaseModel):
 
 @app.post("/agent/patient/stream")
 async def patient_stream(req: PatientStreamRequest):
-    client = get_async_anthropic_client()
-
     async def generator():
         try:
-            async with client.messages.stream(  # type: ignore[attr-defined]
-                model=PATIENT_MODEL,
+            messages = [{"role": "system", "content": req.system}]
+            for m in req.messages:
+                messages.append({"role": m.role, "content": m.content})
+            reply, _ = await llm_provider.chat(
+                messages,
+                tier="fast",
+                effort="low",
                 max_tokens=PATIENT_MAX_TOKENS,
-                system=[
-                    {
-                        "type": "text",
-                        "text": req.system,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages=[
-                    {"role": m.role, "content": m.content} for m in req.messages
-                ],
-            ) as stream:
-                async for event in stream:
-                    etype = getattr(event, "type", None)
-                    if etype != "content_block_delta":
-                        continue
-                    delta = getattr(event, "delta", None)
-                    if getattr(delta, "type", None) != "text_delta":
-                        continue
-                    text = getattr(delta, "text", "")
-                    if not text:
-                        continue
-                    yield "data: " + json.dumps({"text": text}) + "\n\n"
+            )
+            content = reply.get("content", "") if isinstance(reply, dict) else str(reply)
+            content = strip_think(content)
+            if content:
+                yield "data: " + json.dumps({"text": content}) + "\n\n"
             yield "data: " + json.dumps({"done": True}) + "\n\n"
         except asyncio.CancelledError:
             raise

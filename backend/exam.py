@@ -1,7 +1,7 @@
 """Physical examination: POST /agent/exam/perform.
 
 The trainee examines one body system (by voice or a click). Findings come from
-the OpenAI-compatible provider (Sarvam first, Groq fallback) in JSON mode at
+the OpenAI-compatible provider powered by Gemini in JSON mode at
 low temperature, are validated and reconciled against the documented vitals,
 and are cached per (caseId, system) so a repeat exam of the same patient gives
 the same findings. The "vitals" system is deterministic and never calls the
@@ -473,6 +473,8 @@ async def _llm(req: ExamRequest) -> Optional[str]:
                 json_mode=True,
                 max_tokens=700,
                 temperature=0.1,
+                tier="fast",
+                effort="low",
             ),
             timeout=EXAM_TIMEOUT_S,
         )

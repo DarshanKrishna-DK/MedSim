@@ -49,11 +49,9 @@ log = logging.getLogger("medsim.viva")
 router = APIRouter()
 
 VIVA_CASE_ID = "viva-examiner"
-# Senior male examiner. Not in the English/Hindi patient pools, and it lists
-# every Indian locale the app speaks (en, hi, kn, ta, te, mr, bn) in the live
-# Murf FALCON voice list (checked 2026-11-21). MURF_VIVA_VOICE overrides it
-# for English sessions only (an override may not list the other locales).
-EXAMINER_VOICE = "hi-IN-pranav"
+# Senior male examiner voice (Google Gemini voice 'Charon').
+EXAMINER_VOICE = "Charon"
+GEMINI_EXAMINER_VOICE = "Charon"
 
 # The examiner's "thinking" fillers. The patient pool ("Haan, doctor...")
 # would sound wrong from a professor.
@@ -279,7 +277,15 @@ async def _generate_plan(req: PlanRequest) -> list[dict[str, Any]]:
     async with httpx.AsyncClient(timeout=ATTEMPT_TIMEOUT_S) as client:
         for attempt in range(2):
             msg, provider = await asyncio.wait_for(
-                chat(messages, json_mode=True, max_tokens=2400, temperature=0.5, client=client),
+                chat(
+                    messages,
+                    json_mode=True,
+                    max_tokens=2400,
+                    temperature=0.5,
+                    client=client,
+                    tier="reasoning",
+                    effort="medium",
+                ),
                 timeout=ATTEMPT_TIMEOUT_S * 1.5,
             )
             content = msg.get("content") or ""
@@ -524,7 +530,14 @@ async def viva_grade(req: GradeRequest):
     if not student_lines(req.transcript):
         return no_answer_result(req, plan)
     msg, _ = await asyncio.wait_for(
-        chat(grade_messages(req, plan), json_mode=True, max_tokens=2600, temperature=0.1),
+        chat(
+            grade_messages(req, plan),
+            json_mode=True,
+            max_tokens=2600,
+            temperature=0.1,
+            tier="reasoning",
+            effort="medium",
+        ),
         timeout=ATTEMPT_TIMEOUT_S * 1.5,
     )
     try:
@@ -564,7 +577,10 @@ async def viva_ask(req: AskRequest):
     sends the same persona + plan prompt the voice agent gets (language rules
     are already inside it)."""
     msgs = [{"role": "system", "content": req.system}] + [m.model_dump() for m in req.messages[-24:]]
-    msg, _ = await asyncio.wait_for(chat(msgs, max_tokens=220, temperature=0.5), timeout=ATTEMPT_TIMEOUT_S * 1.5)
+    msg, _ = await asyncio.wait_for(
+        chat(msgs, max_tokens=220, temperature=0.5, tier="reasoning", effort="medium"),
+        timeout=ATTEMPT_TIMEOUT_S * 1.5,
+    )
     text = clean_reply(msg.get("content") or "")
     if not text:
         raise HTTPException(status_code=502, detail="Examiner model returned an empty reply")

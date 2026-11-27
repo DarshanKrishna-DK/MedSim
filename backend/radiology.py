@@ -8,7 +8,7 @@
 
 The answer key (findings with keywords, diagnosis, distractors) lives in
 src/data/radiologyCases.json, the same file the frontend renders, so there is
-one source of truth. Grading asks the LLM (Sarvam first, Groq fallback, via
+one source of truth. Grading asks the LLM powered by Gemini (via
 llm_provider.chat) for strict JSON and validates it against the key. If the
 model is unavailable, slow or malformed, a deterministic keyword grader takes
 over, so the endpoint always answers. Synthetic training content only.
@@ -229,6 +229,8 @@ async def _llm_json(system: str, user: str, max_tokens: int) -> Optional[dict[st
                 json_mode=True,
                 max_tokens=max_tokens,
                 temperature=0.1,
+                tier="reasoning",
+                effort="medium",
             ),
             timeout=LLM_TIMEOUT_S,
         )

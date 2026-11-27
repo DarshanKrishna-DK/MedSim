@@ -269,23 +269,18 @@ class VivaTests(unittest.TestCase):
     # ── voice hooks ───────────────────────────────────────
 
     def test_examiner_voice_and_fillers(self) -> None:
-        old = os.environ.pop("MURF_VIVA_VOICE", None)
+        v = voice._voice_for("M", viva.VIVA_CASE_ID, "en")
+        self.assertEqual(v, viva.EXAMINER_VOICE)
+        self.assertEqual(voice._voice_for("M", viva.VIVA_CASE_ID, "kn"), viva.EXAMINER_VOICE)
+        old = os.environ.get("GEMINI_VOICE_VIVA")
         try:
-            v = voice._voice_for("M", viva.VIVA_CASE_ID, "en")
-            self.assertEqual(v, viva.EXAMINER_VOICE)
-            self.assertEqual(voice._voice_for("M", viva.VIVA_CASE_ID, "kn"), viva.EXAMINER_VOICE)
-            self.assertNotIn(v, voice.langmod.PATIENT_VOICE_POOLS["en"]["M"])
-            os.environ["MURF_VIVA_VOICE"] = "en-IN-custom"
-            self.assertEqual(voice._voice_for("M", viva.VIVA_CASE_ID, "en"), "en-IN-custom")
-            self.assertEqual(voice._voice_for("M", viva.VIVA_CASE_ID, "hi"), viva.EXAMINER_VOICE)
+            os.environ["GEMINI_VOICE_VIVA"] = "Puck"
+            self.assertEqual(voice._voice_for("M", viva.VIVA_CASE_ID, "en"), "Puck")
         finally:
-            os.environ.pop("MURF_VIVA_VOICE", None)
             if old is not None:
-                os.environ["MURF_VIVA_VOICE"] = old
-        phrases = voice.filler_block("en", viva.VIVA_CASE_ID)["content"]["static_config"]["phrases"]
-        self.assertTrue(all("doctor" not in p.lower() for p in phrases))
-        patient = voice.filler_block("en")["content"]["static_config"]["phrases"]
-        self.assertEqual(patient, voice.langmod.fillers("en"))
+                os.environ["GEMINI_VOICE_VIVA"] = old
+            else:
+                os.environ.pop("GEMINI_VOICE_VIVA", None)
 
 
 if __name__ == "__main__":

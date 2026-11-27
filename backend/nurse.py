@@ -1,6 +1,6 @@
 """Agentic charge nurse: POST /agent/nurse/act.
 
-An OpenAI-compatible tool-use loop (Sarvam first, Groq fallback) that turns the
+An OpenAI-compatible tool-use loop powered by Gemini that turns the
 doctor's spoken orders into executed actions. Tools run server-side against the
 request payload only; nothing is fabricated beyond tool output.
 """
@@ -821,7 +821,15 @@ async def _run_native(st: NurseState, messages: list[dict[str, Any]], steps: lis
     plan = ""
     provider: Optional[str] = None
     for _ in range(MAX_ITERATIONS):
-        msg, provider = await chat(messages, tools=TOOL_SPECS, max_tokens=500, temperature=0.1, stick_to=provider)
+        msg, provider = await chat(
+            messages,
+            tools=TOOL_SPECS,
+            max_tokens=500,
+            temperature=0.1,
+            stick_to=provider,
+            tier="fast",
+            effort="low",
+        )
         content = strip_think(msg.get("content") or "")
         calls = msg.get("tool_calls") or []
         if not calls:
@@ -842,7 +850,13 @@ async def _run_native(st: NurseState, messages: list[dict[str, Any]], steps: lis
             steps.append({"tool": name, "args": args, "ok": bool(res.get("ok")), "summary": summarize(name, args, res), "result": res})
             messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(res)})
     # iteration cap: ask for the closing sentence without tools
-    msg, _ = await chat(messages + [{"role": "user", "content": "Give the one-sentence spoken confirmation now."}], max_tokens=120, stick_to=provider)
+    msg, _ = await chat(
+        messages + [{"role": "user", "content": "Give the one-sentence spoken confirmation now."}],
+        max_tokens=120,
+        stick_to=provider,
+        tier="fast",
+        effort="low",
+    )
     return plan, strip_think(msg.get("content") or "")
 
 
@@ -860,7 +874,11 @@ async def _run_json_plan(st: NurseState, req: NurseActRequest, steps: list[dict[
     )
     msg, prov = await chat(
         [{"role": "system", "content": sys_msg}, {"role": "user", "content": req.utterance}],
-        json_mode=True, max_tokens=500, temperature=0.1,
+        json_mode=True,
+        max_tokens=500,
+        temperature=0.1,
+        tier="fast",
+        effort="low",
     )
     plan_obj = _parse_json(msg.get("content") or "") or {}
     calls = plan_obj.get("calls")
@@ -875,7 +893,10 @@ async def _run_json_plan(st: NurseState, req: NurseActRequest, steps: list[dict[
     msg2, _ = await chat(
         [{"role": "system", "content": langmod.with_language("Write a short spoken confirmation (max 30 words, no markdown, no 'Done -' prefix) as a warm Indian charge nurse talking to the doctor: contractions, numbers as words, commas and '...' for pauses, e.g. 'Okay doctor, I've sent the troponin and ECG... anything else?'. Mention anything refused or abnormal. Use only the facts given.", req.lang, female=True, role="nurse")},
          {"role": "user", "content": json.dumps([{"tool": s["tool"], "summary": s["summary"]} for s in steps])}],
-        max_tokens=120, stick_to=prov,
+        max_tokens=120,
+        stick_to=prov,
+        tier="fast",
+        effort="low",
     )
     return str(plan_obj.get("plan", "")), strip_think(msg2.get("content") or "")
 

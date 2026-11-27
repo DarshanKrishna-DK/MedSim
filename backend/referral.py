@@ -1,7 +1,7 @@
 """Referral letter pipeline for the nurse tool `refer_patient`.
 
 FHIR ServiceRequest (category referral) + SBAR letter (LLM, with a deterministic
-fallback) + Google Doc/PDF via the Apps Script bridge + a Murf voice handover,
+fallback) + Google Doc/PDF via the Apps Script bridge + a Gemini TTS voice handover,
 optionally delivered to a consultant (REFERRAL_DEST). Every step degrades on its
 own; nothing here raises. Every artifact is labelled as a simulation.
 """
@@ -144,13 +144,13 @@ async def _doc(ctx: dict[str, Any], sbar: dict[str, str]) -> Optional[dict]:
 
 
 async def _voice(script: str) -> tuple[Optional[bytes], Optional[str]]:
-    """Murf handover. Returns (mp3, public audio url) or (None, None)."""
+    """Gemini TTS handover. Returns (wav, public audio url) or (None, None)."""
     from integrations import notify
     import rx_audio
 
     try:
-        mp3, _voice_id, _locale = await asyncio.wait_for(rx_audio.synthesize(script, "en"), timeout=40.0)
-        return mp3, notify.absolute_url(notify.store_audio(mp3))
+        audio, _voice_id, _locale = await asyncio.wait_for(rx_audio.synthesize(script, "en"), timeout=40.0)
+        return audio, notify.absolute_url(notify.store_audio(audio))
     except Exception as e:  # noqa: BLE001
         log.warning("referral voice failed: %s", type(e).__name__)
         return None, None

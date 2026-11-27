@@ -1,43 +1,18 @@
 /**
- * Real-time voice conversation, backed by Agora Conversational AI.
- *
- * Public API surface kept from the previous LiveKit implementation so
- * existing consumers (FloatingVoicePanel, DockedVoicePanel, ExamineOverlay,
- * conversationStore) keep compiling without changes.
- *
- * Pipeline:
- *   1. `init()` → POST /voice/start. The backend starts an Agora
- *      Conversational AI agent in a fresh channel (ASR = ARES,
- *      LLM = patient persona, TTS = Murf Falcon, data_channel = "rtm") and
- *      returns an RTC+RTM token for our uid.
- *   2. RTM login + subscribe to the channel name → transcripts and agent
- *      state arrive as RTM channel messages / presence events.
- *   3. RTC join, publish mic, subscribe to the agent's audio and play it.
- *      `getMouthAmplitude()` reads the remote track's volume for lip-sync.
- *
- * Transcript wire format (agent → RTM channel message, JSON string):
- *   { object: "user.transcription", text, final: boolean, turn_id, stream_id, user_id }
- *   { object: "assistant.transcription", text, turn_status: 0|1|2, turn_id, quiet, words }
- *       turn_status: 0 = in progress, 1 = end, 2 = interrupted. In text mode
- *       `text` is the cumulative text of the turn so far.
- *   { object: "message.interrupt", turn_id }
- * Agent state arrives as RTM presence REMOTE_STATE_CHANGED with
- *   stateChanged = { state: "idle"|"listening"|"thinking"|"speaking"|"silent", turn_id }.
- * (Same format as agora-agent-client-toolkit's CovSubRenderController.)
+ * Real-time voice conversation, backed by native WebSockets + WebAudio PCM streaming.
+ * Replaces Agora RTC/RTM SDKs with pure browser standards:
+ *   - 16kHz Int16 PCM capture via MicStreamer
+ *   - 24kHz Int16 PCM playback via PcmPlayer
+ *   - Native WebSocket connection to /voice/live/{channel}?token=...
  */
 
-import AgoraRTC, {
-  type IAgoraRTCClient,
-  type IAgoraRTCRemoteUser,
-  type IMicrophoneAudioTrack,
-  type IRemoteAudioTrack,
-  type IRemoteVideoTrack,
-} from 'agora-rtc-sdk-ng';
-import AgoraRTM, { type RTMClient } from 'agora-rtm';
 import { voiceMetrics } from './voiceMetrics';
 import { streamClaude, type ChatMessage } from './claude';
-import { decodeRtmJson, mergeTurnText, parseAgentMessage, type AgentRtmMessage } from './transcriptParser';
+import { mergeTurnText, parseAgentMessage, type AgentRtmMessage } from './transcriptParser';
 import { startAgentEventPoller, type AgentEvent } from '../agents/agentEvents';
+import { MicStreamer, PcmPlayer } from './pcmAudio';
+import type { AvatarTrack } from '../components/AvatarVideo';
+import { forwardStudentAudio, forwardAgentAudio, forwardLiveTranscript } from '../observer/studentLink';
 
 const LOG = '[medsim:voice]';
 
@@ -128,7 +103,7 @@ export interface ConversationOptions {
   storageKey?: string;
   /** BCP-47 locale hint for ASR/TTS (backend default if omitted). */
   locale?: string;
-  /** Ask the backend for an Agora avatar (undefined = backend default). */
+  /** Ask the backend for an avatar (undefined = backend default). */
   avatar?: boolean;
   /** Custom agent start endpoint (default /voice/start). The persona then
    *  lives server-side: `startBody` is posted as is, instead of the prompt. */
@@ -142,17 +117,16 @@ export interface ConversationOptions {
 }
 
 interface VoiceStartResponse {
-  appId: string;
+  appId?: string;
   channel: string;
   uid: number;
   token: string;
   agentUid: number;
   agentId: string;
-  /** Set when an Agora avatar joined the channel as a separate video user. */
   avatarUid?: number;
   avatarError?: string;
-  /** True when this agent runs its own tools server-side (custom LLM route). */
   toolsEnabled?: boolean;
+  wsUrl?: string;
 }
 
 // ── backend helpers ─────────────────────────────────────────────
@@ -163,9 +137,9 @@ function friendlyBackendError(status: number, body: string): string {
   const b = body.toLowerCase();
   if (
     status === 503 ||
-    /not configured|missing .*key|agora_app|murf|no app ?id|app_certificate/.test(b)
+    /not configured|missing .*key|gemini_api_key|no app ?id/.test(b)
   ) {
-    return 'Voice backend not configured, add Agora/Murf keys to backend/.env.local.';
+    return 'Voice backend not configured, add Gemini API keys to backend/.env.local.';
   }
   if (status === 502 || status === 504 || (status === 500 && body.trim() === '')) {
     return 'Voice backend unreachable, start backend/server.py on :8787.';
@@ -204,18 +178,11 @@ function friendlyMediaError(err: unknown): string | null {
   if (code === 'DEVICE_NOT_FOUND' || name === 'NotFoundError') {
     return 'No microphone found.';
   }
-  if (code === 'INVALID_PARAMS' && /appid/i.test(msg)) {
-    return 'Voice backend not configured, invalid Agora App ID.';
-  }
-  if (/token|dynamic key|CAN_NOT_GET_GATEWAY_SERVER/i.test(`${code} ${msg}`)) {
-    return `Agora rejected the session token (${code || msg}). Check AGORA_APP_ID / AGORA_APP_CERTIFICATE.`;
-  }
   return null;
 }
 
 // ── page-unload safety net: stop any agents we started ─────────
 
-/** agentId -> stop endpoint. */
 const liveAgentIds = new Map<string, string>();
 let unloadHookInstalled = false;
 function installUnloadHook() {
@@ -232,21 +199,6 @@ function installUnloadHook() {
   });
 }
 
-// Agora's SDK is chatty at INFO. Warnings and errors only.
-try { AgoraRTC.setLogLevel(2); } catch { /* noop */ }
-
-// Remote audio play() can be blocked by autoplay policy if the gesture
-// chain was broken. Resume all pending tracks on the next user gesture.
-const pendingAutoplay = new Set<IRemoteAudioTrack>();
-AgoraRTC.onAutoplayFailed = () => {
-  const resume = () => {
-    for (const t of pendingAutoplay) { try { t.play(); } catch { /* noop */ } }
-    pendingAutoplay.clear();
-  };
-  window.addEventListener('pointerdown', resume, { once: true });
-  window.addEventListener('keydown', resume, { once: true });
-};
-
 function normWords(s: string): string {
   return s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, '').replace(/\s+/g, ' ').trim();
 }
@@ -258,13 +210,12 @@ export class Conversation {
   private listeners: ConversationListeners = {};
   private status: ConversationStatus = 'uninitialized';
 
-  private rtc: IAgoraRTCClient | null = null;
-  private rtm: RTMClient | null = null;
-  private micTrack: IMicrophoneAudioTrack | null = null;
-  private remoteAudio: IRemoteAudioTrack | null = null;
-  private avatarAudioOn = false;
-  private avatarVideo: IRemoteVideoTrack | null = null;
-  private avatarListeners = new Set<(t: IRemoteVideoTrack | null) => void>();
+  private streamer: MicStreamer | null = null;
+  private player: PcmPlayer | null = null;
+  private ws: WebSocket | null = null;
+
+  private avatarVideo: AvatarTrack | null = null;
+  private avatarListeners = new Set<(t: AvatarTrack | null) => void>();
   private session: VoiceStartResponse | null = null;
   private disposed = false;
   private micMuted = false;
@@ -295,16 +246,13 @@ export class Conversation {
 
   // Transcript assembly. Key = `${role}:${turn_id}` → index into messages.
   private turnIndex = new Map<string, number>();
-  /** True once we've seen an RTM presence agent-state event. When present
-   *  it is the authority for speaking → ready, because text-mode transcripts
-   *  can be marked final before the TTS audio has finished. */
   private hasAgentStateFeed = false;
   private agentState: AgentState = 'idle';
 
   // Nurse prefilter debounce, a user turn can arrive as several finals.
   private nurseTimer: number | null = null;
   private nurseCandidate = '';
-  /** Normalised typed messages sent over RTM, awaiting a possible echo. */
+  /** Normalised typed messages sent over WebSocket, awaiting a possible echo. */
   private pendingTyped: string[] = [];
 
   constructor(
@@ -376,35 +324,29 @@ export class Conversation {
     this.messageSubscribers.forEach((fn) => fn(snap));
   }
 
-  /** Avatar video track once the avatar user publishes, else null. */
-  getAvatarTrack(): IRemoteVideoTrack | null {
+  /** Avatar video track if present, else null. */
+  getAvatarTrack(): AvatarTrack | null {
     return this.avatarVideo;
   }
 
   /** Subscribe to avatar video changes. Fires immediately with the current track. */
-  onAvatarTrack(fn: (t: IRemoteVideoTrack | null) => void): () => void {
+  onAvatarTrack(fn: (t: AvatarTrack | null) => void): () => void {
     this.avatarListeners.add(fn);
     fn(this.avatarVideo);
     return () => { this.avatarListeners.delete(fn); };
   }
 
-  private setAvatarTrack(t: IRemoteVideoTrack | null): void {
+  private setAvatarTrack(t: AvatarTrack | null): void {
     this.avatarVideo = t;
     this.avatarListeners.forEach((fn) => fn(t));
   }
 
-  /** Live mouth amplitude from the agent's remote audio track volume.
+  /** Live mouth amplitude from the agent's PCM playback level.
    *  0..1, usable directly as a mouth-open factor. Cheap, safe to call
    *  every animation frame. */
   getMouthAmplitude(): number {
-    const t = this.remoteAudio;
-    if (!t) return 0;
-    let level = 0;
-    try { level = t.getVolumeLevel(); } catch { level = 0; }
-    // Speech typically sits at 0.05–0.5 on Agora's scale; boost into a
-    // visible mouth range, then smooth to avoid flicker.
-    const target = Math.min(1, level * 2.4);
-    this.smoothedAmp = this.smoothedAmp * 0.45 + target * 0.55;
+    const playerLevel = this.player?.getOutputLevel() ?? 0;
+    this.smoothedAmp = this.smoothedAmp * 0.45 + playerLevel * 0.55;
     return this.smoothedAmp < 0.02 ? 0 : this.smoothedAmp;
   }
 
@@ -414,15 +356,15 @@ export class Conversation {
 
   // ── additions (non-breaking) used by the nurse agent ──────────
 
-  /** Agora agent id for this session, or null if voice isn't live. */
+  /** Agent id for this session, or null if voice isn't live. */
   getAgentId(): string | null {
     return this.session?.agentId ?? null;
   }
 
-  /** Agora channel identity of the live call (observer invites), or null. */
+  /** Voice channel identity of the live call (observer invites), or null. */
   getSessionInfo(): { appId: string; channel: string; uid: number; agentUid: number } | null {
     const s = this.session;
-    return s ? { appId: s.appId, channel: s.channel, uid: s.uid, agentUid: s.agentUid } : null;
+    return s ? { appId: s.appId ?? '', channel: s.channel, uid: s.uid, agentUid: s.agentUid } : null;
   }
 
   getCaseId(): string {
@@ -446,20 +388,17 @@ export class Conversation {
     }
   }
 
-  /** Mute/unmute the doctor's mic without changing conversation status.
-   *  Used while the nurse TTS plays so it isn't transcribed as the doctor. */
+  /** Mute/unmute the doctor's mic without changing conversation status. */
   isMicMuted(): boolean {
     return this.micMuted;
   }
 
   setMicMuted(muted: boolean) {
     this.micMuted = muted;
-    if (this.micTrack) this.micTrack.setMuted(muted).catch(() => undefined);
+    this.streamer?.setMuted(muted);
   }
 
-  /** Append a note to the patient persona (e.g. "The nurse just drew blood
-   *  for a CBC") and push the updated prompt to the live agent. Also
-   *  updates the prompt used by the typed-chat path. */
+  /** Append a note to the patient persona and push the updated prompt to the live agent. */
   async appendContextNote(note: string): Promise<void> {
     const clean = note.trim();
     if (!clean) return;
@@ -493,7 +432,6 @@ export class Conversation {
     const key = turnId === undefined || turnId === null ? null : `${role}:${String(turnId)}`;
     const idx = key ? this.turnIndex.get(key) : undefined;
     if (idx !== undefined && this.messages[idx]?.role === role) {
-      // Cumulative updates replace; segmented finals append.
       const next = mergeTurnText(this.messages[idx].content, text, role);
       this.messages[idx] = { role, content: next };
       return next;
@@ -510,8 +448,6 @@ export class Conversation {
       if (this.status !== 'listening') this.setStatus('listening');
       return;
     }
-    // A typed message injected over RTM may be echoed back as a user
-    // transcription, it's already in the transcript, so swallow it.
     const echoAt = this.pendingTyped.indexOf(normWords(text));
     if (echoAt >= 0) {
       this.pendingTyped.splice(echoAt, 1);
@@ -561,10 +497,38 @@ export class Conversation {
     }
   }
 
-  private handleRtmPayload(raw: string | Uint8Array) {
-    const msg = decodeRtmJson(raw);
-    if (!msg) return;
-    voiceMetrics.ingestRtm(this.caseId, msg); // diagnostics panel + debrief stats
+  private handleWsJsonMessage(msg: Record<string, unknown>) {
+    const obj = String(msg.object || msg.type || '');
+    msg.object = obj;
+
+    // Diagnostics panel + debrief stats
+    voiceMetrics.ingestRtm(this.caseId, msg);
+
+    // Forward live transcript & event frames to studentLink observer if active
+    forwardLiveTranscript(msg);
+
+    if (obj === 'message.interrupt' || obj === 'interrupt') {
+      this.player?.clear();
+      if (this.status === 'speaking') this.setStatus('listening');
+      return;
+    }
+
+    if (obj === 'state' || obj === 'agent_state' || msg.state) {
+      const st = String(msg.state || msg.agent_state || '');
+      if (st) this.handleAgentState(st);
+      return;
+    }
+
+    if (obj === 'closed') {
+      const reason = String(msg.reason || 'agent left');
+      if (!this.disposed) {
+        this.player?.clear();
+        this.listeners.onError?.(`The patient voice agent left the call (${reason}). Press T to reconnect.`);
+        this.setStatus('error', 'agent left');
+      }
+      return;
+    }
+
     const m = parseAgentMessage(msg);
     if (!m) return;
     switch (m.kind) {
@@ -575,6 +539,7 @@ export class Conversation {
         this.handleAgentTranscription(m);
         break;
       case 'interrupt':
+        this.player?.clear();
         if (this.status === 'speaking') this.setStatus('listening');
         break;
       case 'error':
@@ -592,21 +557,15 @@ export class Conversation {
       this.nurseCandidate = '';
       if (this.disposed || !utterance) return;
       if (this.caseId === RECEPTIONIST_SESSION) {
-        // Tool-enabled Priya acts on her own inside the call; the keyword
-        // trigger is only the fallback when the proxy route is unavailable.
         if (this.isToolEnabled()) return;
         return void runReceptionFromSession(utterance, 'voice');
       }
       if (!this.clinicalAgents) return;
-      // Dynamic import breaks the conversation ↔ nurseAgent ↔ store cycle.
       void Promise.all([import('../agents/examAgent'), import('../agents/nurseAgent'), import('../agents/coach'), import('../observer/observerCall')])
         .then(([ex, m, coach, obs]) => {
-          // "Invite Darshan to observe": Asha phones the observer, not a nurse order.
           if (obs.maybeHandleObserverCommand(utterance)) return;
           if (coach.isHintRequest(utterance)) return void coach.requestHint();
-          // Anything said to the nurse goes to her LLM, which decides the intent.
           if (m.isAddressedToNurse(utterance)) return void m.runNurseAction(utterance, 'voice');
-          // An exam request ("let me check your abdomen") is not a nurse order.
           if (ex.maybeRunExamFromSpeech(utterance)) return;
           if (m.looksLikeOrder(utterance)) void m.runNurseAction(utterance, 'voice');
         })
@@ -639,126 +598,124 @@ export class Conversation {
               ...(this.agentContext ? { agentContext: this.agentContext } : {}),
             },
       );
-      if (!session || !session.appId || !session.channel || !session.token) {
-        throw new VoiceBackendError(`Voice backend not configured, ${startUrl} returned no Agora session.`);
+      if (!session || !session.channel) {
+        throw new VoiceBackendError(`Voice backend not configured, ${startUrl} returned no session.`);
       }
       this.session = session;
       liveAgentIds.set(session.agentId, this.stopUrl);
-      if (this.disposed) return this.teardown();
-
-      // 1. RTM first so we don't miss the greeting transcript.
-      this.listeners.onProgress?.('Connecting transcript channel…');
-      try {
-        const rtm = new AgoraRTM.RTM(session.appId, String(session.uid));
-        this.rtm = rtm;
-        rtm.addEventListener('message', (ev) => {
-          if (ev.channelName && ev.channelName !== session.channel) return;
-          this.handleRtmPayload(ev.message);
-        });
-        rtm.addEventListener('presence', (ev) => {
-          const st = ev.stateChanged as Record<string, unknown> | null | undefined;
-          if (!st || typeof st.state !== 'string') return;
-          if (String(ev.publisher) !== String(session.agentUid)) {
-            // The agent may publish under its own uid; accept anything
-            // that isn't us.
-            if (String(ev.publisher) === String(session.uid)) return;
-          }
-          this.handleAgentState(st.state);
-        });
-        await rtm.login({ token: session.token });
-        if (this.disposed) return this.teardown();
-        await rtm.subscribe(session.channel, { withMessage: true, withPresence: true });
-      } catch (err) {
-        // Transcripts are nice-to-have; audio still works without them.
-        console.warn(LOG, 'RTM unavailable, continuing without transcripts:', err);
-        this.listeners.onProgress?.('Transcripts unavailable, audio only.');
-      }
-      if (this.disposed) return this.teardown();
-
-      // 2. RTC: join, subscribe to agent audio, publish mic.
-      this.listeners.onProgress?.('Joining voice channel…');
-      const rtc = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
-      this.rtc = rtc;
-      rtc.on('user-published', async (user: IAgoraRTCRemoteUser, mediaType) => {
-        if (mediaType === 'video') {
-          if (session.avatarUid == null || String(user.uid) !== String(session.avatarUid)) return;
-          try {
-            await rtc.subscribe(user, 'video');
-            if (user.videoTrack) this.setAvatarTrack(user.videoTrack);
-          } catch (err) {
-            console.warn(LOG, 'avatar video subscribe failed:', err);
-          }
-          return;
-        }
-        if (mediaType !== 'audio') return;
-        try {
-          await rtc.subscribe(user, 'audio');
-          const track = user.audioTrack;
-          if (!track) return;
-          const isAvatar = session.avatarUid != null && String(user.uid) === String(session.avatarUid);
-          if (isAvatar) {
-            // The avatar re-publishes the agent's voice in sync with its lips:
-            // play that one and silence the agent's own stream (no double audio).
-            if (this.remoteAudio) {
-              try { this.remoteAudio.stop(); } catch { /* noop */ }
-              pendingAutoplay.delete(this.remoteAudio);
-            }
-            this.avatarAudioOn = true;
-            pendingAutoplay.add(track);
-            track.play();
-            return;
-          }
-          this.remoteAudio = track;
-          if (this.avatarAudioOn) return;
-          pendingAutoplay.add(track);
-          track.play();
-        } catch (err) {
-          console.warn(LOG, 'subscribe failed:', err);
-        }
-      });
-      rtc.on('user-unpublished', (user: IAgoraRTCRemoteUser, mediaType) => {
-        if (mediaType === 'video' && user.videoTrack === this.avatarVideo) this.setAvatarTrack(null);
-        if (mediaType === 'audio' && user.audioTrack === this.remoteAudio) {
-          if (this.remoteAudio) pendingAutoplay.delete(this.remoteAudio);
-          this.remoteAudio = null;
-        }
-      });
-      rtc.on('user-left', (user: IAgoraRTCRemoteUser) => {
-        if (String(user.uid) === String(session.agentUid) && !this.disposed) {
-          this.remoteAudio = null;
-          this.listeners.onError?.('The patient voice agent left the call. Press T to reconnect.');
-          this.setStatus('error', 'agent left');
-        }
-      });
-      rtc.on('connection-state-change', (cur) => {
-        if (cur === 'DISCONNECTED' && !this.disposed && this.status !== 'error') {
-          this.setStatus('uninitialized');
-        }
-      });
-
-      await rtc.join(session.appId, session.channel, session.token, session.uid);
       if (this.disposed) return this.teardown();
 
       if (this.audioCtx.state === 'suspended') {
         try { await this.audioCtx.resume(); } catch { /* noop */ }
       }
 
-      this.listeners.onProgress?.('Enabling microphone…');
-      const mic = await AgoraRTC.createMicrophoneAudioTrack({ AEC: true, ANS: true, AGC: true });
-      this.micTrack = mic;
+      // Initialize 24kHz PCM player for incoming audio
+      this.player = new PcmPlayer(this.audioCtx, 24000);
+
+      // Connect to native WebSocket: ws(s)://{host}/voice/live/{channel}?token=...
+      this.listeners.onProgress?.('Connecting live voice stream…');
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.host;
+      const wsUrl = session.wsUrl
+        ? (session.wsUrl.startsWith('ws') ? session.wsUrl : `${proto}//${host}${session.wsUrl}`)
+        : `${proto}//${host}/voice/live/${encodeURIComponent(session.channel)}?token=${encodeURIComponent(session.token || '')}`;
+
+      const ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+      this.ws = ws;
+
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const timer = window.setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            reject(new Error('Voice WebSocket connection timed out.'));
+          }
+        }, 12000);
+
+        ws.onopen = () => {
+          if (!settled) {
+            settled = true;
+            window.clearTimeout(timer);
+            resolve();
+          }
+        };
+
+        ws.onerror = () => {
+          if (!settled) {
+            settled = true;
+            window.clearTimeout(timer);
+            reject(new Error('Voice WebSocket connection failed.'));
+          }
+        };
+      });
+
       if (this.disposed) return this.teardown();
-      await rtc.publish([mic]);
-      if (this.micMuted) await mic.setMuted(true);
+
+      // Configure WebSocket message and close handlers
+      ws.onmessage = (ev: MessageEvent) => {
+        if (ev.data instanceof ArrayBuffer) {
+          // Binary 24kHz PCM from agent
+          this.player?.enqueue(ev.data);
+          forwardAgentAudio(ev.data);
+          if (this.status !== 'speaking' && this.agentState === 'speaking') {
+            this.setStatus('speaking');
+          }
+        } else if (typeof ev.data === 'string') {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg && typeof msg === 'object') {
+              this.handleWsJsonMessage(msg as Record<string, unknown>);
+            }
+          } catch {
+            /* noop */
+          }
+        }
+      };
+
+      ws.onclose = (ev) => {
+        if (this.disposed) return;
+        const isAgentLeft = ev.reason && /agent left|leave|timeout|closed/i.test(ev.reason);
+        if (isAgentLeft || this.status === 'speaking' || this.status === 'ready' || this.status === 'listening' || this.status === 'thinking') {
+          this.listeners.onError?.('The patient voice agent left the call. Press T to reconnect.');
+          this.setStatus('error', 'agent left');
+        } else if (this.status !== 'error') {
+          this.setStatus('uninitialized');
+        }
+      };
+
+      // Start 16kHz PCM capture via MicStreamer
+      this.listeners.onProgress?.('Enabling microphone…');
+      const streamer = new MicStreamer(this.audioCtx);
+      this.streamer = streamer;
+
+      streamer.onChunk((chunk: ArrayBuffer) => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(chunk);
+        }
+        forwardStudentAudio(chunk);
+      });
+
+      streamer.onLevel((lvl: number) => {
+        if (lvl > 0.05 && this.status === 'ready') {
+          this.setStatus('listening');
+        }
+      });
+
+      await streamer.start();
+      if (this.disposed) return this.teardown();
+
+      if (this.micMuted) streamer.setMuted(true);
 
       this.listeners.onProgress?.('Live.');
       this.setStatus('ready');
+
       if (session.toolsEnabled && this.listeners.onAgentEvents) {
         this.stopEvents = startAgentEventPoller(session.channel, (evs) => {
           if (!this.disposed) this.listeners.onAgentEvents?.(evs);
         });
       }
 
-      // Placeholder until the agent's greeting transcript arrives.
       this.listeners.onSubtitle?.({ who: 'patient', text: '…' });
       this.setEmotion(detectEmotion(initialLine));
     } catch (err: any) {
@@ -775,55 +732,47 @@ export class Conversation {
     }
   }
 
-  /** Back-compat. Real-time means the mic is always live; this unmutes it. */
   async startListening() {
     if (this.status === 'uninitialized') return;
     this.micMuted = false;
-    if (this.micTrack) {
-      try { await this.micTrack.setMuted(false); } catch { /* noop */ }
-    }
+    this.streamer?.setMuted(false);
   }
 
-  /** Back-compat no-op. The agent decides turn boundaries via VAD. */
   async stopListeningAndRespond() {
     /* no-op */
   }
 
   cancel() {
-    // Best-effort: mute mic. Real-time has no abort we own client-side.
     this.micMuted = true;
-    if (this.micTrack) this.micTrack.setMuted(true).catch(() => undefined);
+    this.streamer?.setMuted(true);
+    this.player?.clear();
     this.setStatus('ready');
   }
 
-  /** Have the patient speak ONE short farewell out loud via the agent's
-   *  TTS and resolve once the audio has finished (7 s hard cap). Falls back
-   *  to a subtitle-only goodbye when voice isn't connected. */
   async sayFarewell(): Promise<void> {
     const line = FAREWELL_LINES[Math.floor(Math.random() * FAREWELL_LINES.length)];
     this.setStatus('thinking', 'Saying goodbye…');
 
-    // Stop the doctor's mic so the farewell can't trigger another turn.
     this.micMuted = true;
-    if (this.micTrack) {
-      try { await this.micTrack.setMuted(true); } catch { /* noop */ }
-    }
+    this.streamer?.setMuted(true);
 
     const agentId = this.getAgentId();
-    if (agentId && this.rtc) {
+    if (agentId && this.ws && this.ws.readyState === WebSocket.OPEN) {
       let spoke = false;
       try {
         await postVoice('/voice/speak', { agentId, text: line, priority: 'INTERRUPT' });
         spoke = true;
       } catch (err) {
-        console.warn(LOG, 'farewell speak failed:', err);
+        console.warn(LOG, 'farewell speak via POST failed, trying WS:', err);
+        try {
+          this.ws.send(JSON.stringify({ type: 'text', text: line, priority: 'INTERRUPT' }));
+          spoke = true;
+        } catch { /* noop */ }
       }
       this.setEmotion(detectEmotion(line));
       this.listeners.onSubtitle?.({ who: 'patient', text: line });
 
       if (spoke) {
-        // Wait for speaking to start, then stop. Uses both the agent-state
-        // feed and the actual audio level so a missing RTM feed still works.
         const deadline = Date.now() + 7000;
         let sawSpeaking = false;
         let quietSince = 0;
@@ -845,25 +794,16 @@ export class Conversation {
       this.messages.push({ role: 'assistant', content: line });
       this.emitMessages();
     }
-    // Wipe persisted history so a re-encounter with this case doesn't
-    // pop the farewell as the "last assistant message" on greeting.
+
     if (this.storageKey) {
       try { localStorage.removeItem(this.storageKey); } catch { /* noop */ }
     }
     this.setStatus('ready');
   }
 
-  /** Text-chat turn. When the voice agent is live, the text is injected
-   *  into the agent's LLM as a user turn over RTM (peer message,
-   *  customType "user.transcription"), the reply is spoken and arrives
-   *  through the normal transcript path. Otherwise falls back to the
-   *  backend text path (/agent/patient/stream). Typed orders also go to
-   *  the nurse agent. */
   async sendTextMessage(text: string, opts?: { speak?: boolean }): Promise<void> {
     const clean = text.trim();
     if (!clean) return;
-    // Accept typed text in any live state (listening/speaking/thinking are
-    // normal mid-conversation); only refuse while the session is connecting.
     if (this.status === 'loading') return;
 
     this.listeners.onSubtitle?.({ who: 'you', text: clean });
@@ -872,9 +812,10 @@ export class Conversation {
     this.emitMessages();
     this.setStatus('thinking', 'Thinking…');
 
-    // Typed text over RTM reaches a tool-enabled Priya as a normal turn: she acts herself.
-    const viaLiveAgent = !!(this.rtm && this.session && opts?.speak !== false);
-    if (this.caseId === RECEPTIONIST_SESSION && !(viaLiveAgent && this.isToolEnabled())) runReceptionFromSession(clean, 'typed');
+    const viaLiveAgent = !!(this.ws && this.ws.readyState === WebSocket.OPEN && opts?.speak !== false);
+    if (this.caseId === RECEPTIONIST_SESSION && !(viaLiveAgent && this.isToolEnabled())) {
+      runReceptionFromSession(clean, 'typed');
+    }
     if (this.clinicalAgents) {
       void Promise.all([import('../agents/examAgent'), import('../agents/nurseAgent'), import('../agents/coach'), import('../observer/observerCall')])
         .then(([ex, m, coach, obs]) => {
@@ -887,18 +828,21 @@ export class Conversation {
         .catch(() => undefined);
     }
 
-    const session = this.session;
-    if (this.rtm && session && opts?.speak !== false) {
+    if (viaLiveAgent) {
       this.pendingTyped.push(normWords(clean));
       try {
-        await this.rtm.publish(
-          String(session.agentUid),
-          JSON.stringify({ priority: 'interrupted', interruptable: true, message: clean }),
-          { channelType: 'USER', customType: 'user.transcription' },
+        this.ws?.send(
+          JSON.stringify({
+            type: 'text',
+            text: clean,
+            priority: 'interrupted',
+            interruptable: true,
+            message: clean,
+          })
         );
-        return; // reply arrives via assistant.transcription
+        return;
       } catch (err) {
-        console.warn(LOG, 'RTM text send failed, falling back to HTTP:', err);
+        console.warn(LOG, 'WS text send failed, falling back to HTTP:', err);
         this.pendingTyped.pop();
       }
     }
@@ -939,8 +883,6 @@ export class Conversation {
     }
   }
 
-  /** Release Agora resources and stop the backend agent. Safe to call
-   *  more than once and while init() is still in flight. */
   private teardown() {
     if (this.stopEvents) {
       this.stopEvents();
@@ -950,29 +892,26 @@ export class Conversation {
       window.clearTimeout(this.nurseTimer);
       this.nurseTimer = null;
     }
-    if (this.micTrack) {
-      try { this.micTrack.close(); } catch { /* noop */ }
-      this.micTrack = null;
+    if (this.streamer) {
+      this.streamer.stop();
+      this.streamer = null;
+    }
+    if (this.player) {
+      this.player.close();
+      this.player = null;
+    }
+    if (this.ws) {
+      const ws = this.ws;
+      this.ws = null;
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      try { ws.close(); } catch { /* noop */ }
     }
     if (this.avatarVideo) {
-      try { this.avatarVideo.stop(); } catch { /* noop */ }
+      try { this.avatarVideo.stop?.(); } catch { /* noop */ }
       this.setAvatarTrack(null);
-    }
-    if (this.remoteAudio) {
-      pendingAutoplay.delete(this.remoteAudio);
-      try { this.remoteAudio.stop(); } catch { /* noop */ }
-      this.remoteAudio = null;
-    }
-    if (this.rtc) {
-      const rtc = this.rtc;
-      this.rtc = null;
-      rtc.removeAllListeners();
-      rtc.leave().catch(() => undefined);
-    }
-    if (this.rtm) {
-      const rtm = this.rtm;
-      this.rtm = null;
-      rtm.logout().catch(() => undefined);
     }
     if (this.session) {
       const { agentId } = this.session;

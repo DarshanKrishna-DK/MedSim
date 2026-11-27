@@ -1,10 +1,9 @@
 """Voice prescription (/voice/rx-audio): script prompt, safety framing, per-language voice, chunking.
-Murf and the LLM are mocked; no network."""
+Gemini TTS and the LLM are mocked; no network."""
 
 from __future__ import annotations
 
 import base64
-import json
 import os
 import sys
 import unittest
@@ -14,13 +13,12 @@ _B = Path(__file__).resolve().parents[1]
 if str(_B) not in sys.path:
     sys.path.insert(0, str(_B))
 
-import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+import gemini_tts  # noqa: E402
 import lang  # noqa: E402
 import rx_audio  # noqa: E402
 import server  # noqa: E402
-import voice  # noqa: E402
 
 HDR = {"Origin": "http://localhost:5173"}
 SCRIPTS = {
@@ -43,19 +41,20 @@ BODY = {
 
 class RxAudioTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._old = {k: os.environ.get(k) for k in ("MURF_API_KEY", "MURF_NURSE_VOICE")}
-        os.environ["MURF_API_KEY"] = "murf-key-zz"
-        os.environ.pop("MURF_NURSE_VOICE", None)
-        self.murf: list[dict] = []
+        self._old = {k: os.environ.get(k) for k in ("GEMINI_API_KEY", "GEMINI_VOICE_NURSE", "MURF_API_KEY", "MURF_NURSE_VOICE")}
+        os.environ["GEMINI_API_KEY"] = "fake-gemini-key"
+        os.environ.pop("GEMINI_VOICE_NURSE", None)
+        self.tts_calls: list[dict] = []
         self.llm: list[list[dict]] = []
         self.reply = SCRIPTS["en"]
 
-        def handler(req: httpx.Request) -> httpx.Response:
-            self.murf.append(json.loads(req.content))
-            return httpx.Response(200, content=b"ID3chunk")
+        async def fake_synthesize(text, voice=None):
+            self.tts_calls.append({"text": text, "voice": voice})
+            return (gemini_tts.wrap_pcm_in_wav(b"\x00\x00" * 100, 24000), "audio/wav")
 
-        self._orig_client = voice._client_factory
-        voice._client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self._orig_synth = gemini_tts.synthesize_speech
+        gemini_tts.synthesize_speech = fake_synthesize
+
         self._orig_chat = rx_audio.chat
 
         async def fake_chat(messages, **kw):
@@ -66,7 +65,7 @@ class RxAudioTests(unittest.TestCase):
         self.client = TestClient(server.app)
 
     def tearDown(self) -> None:
-        voice._client_factory = self._orig_client
+        gemini_tts.synthesize_speech = self._orig_synth
         rx_audio.chat = self._orig_chat
         for k, v in self._old.items():
             if v is None:
@@ -84,13 +83,11 @@ class RxAudioTests(unittest.TestCase):
             self.assertEqual(r.status_code, 200, r.text)
             d = r.json()
             self.assertEqual(d["lang"], lg)
-            self.assertEqual(d["locale"], lang.locale_for(lg) if lg != "en" else "en-US")
-            self.assertEqual(d["mime"], "audio/mpeg")
-            self.assertEqual(d["voiceId"], lang.nurse_voice(lg))
-            self.assertTrue(base64.b64decode(d["audioBase64"]).startswith(b"ID3"))
-            self.assertEqual(self.murf[-1]["format"], "MP3")
-            self.assertEqual(self.murf[-1]["voiceId"], d["voiceId"])
-            self.assertEqual(self.murf[-1]["locale"], d["locale"])
+            self.assertEqual(d["locale"], lang.locale_for(lg))
+            self.assertEqual(d["mime"], "audio/wav")
+            self.assertEqual(d["voiceId"], gemini_tts.pick_voice_for_role("nurse", "poly-12", lg))
+            self.assertTrue(base64.b64decode(d["audioBase64"]).startswith(b"RIFF"))
+            self.assertEqual(self.tts_calls[-1]["voice"], d["voiceId"])
             if lg != "en":
                 self.assertTrue(lang.has_script(d["script"], lg))
 
@@ -124,10 +121,10 @@ class RxAudioTests(unittest.TestCase):
         self.reply = SCRIPTS["en"]  # English text for a Tamil request is rejected
         r = self.client.post("/voice/rx-audio", headers=HDR, json={**BODY, "lang": "ta"})
         self.assertEqual(r.status_code, 502)
-        self.assertEqual(self.murf, [])
+        self.assertEqual(self.tts_calls, [])
 
-    def test_missing_murf_key_is_503(self) -> None:
-        os.environ.pop("MURF_API_KEY", None)
+    def test_missing_gemini_key_is_503(self) -> None:
+        os.environ.pop("GEMINI_API_KEY", None)
         self.assertEqual(self._post("en").status_code, 503)
 
     def test_clean_and_chunk(self) -> None:

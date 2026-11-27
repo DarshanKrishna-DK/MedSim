@@ -1,7 +1,7 @@
 """Consultation result delivery: POST /agent/results/send.
 
 Sends the student's debrief to Telegram (the existing notify channel): a Telegram HTML
-summary, a one-page PDF report card (pdf_report.py) and a short Murf voice summary in the
+summary, a one-page PDF report card (pdf_report.py) and a short Gemini TTS voice summary in the
 session language (best effort). Rate limited per destination; NOTIFY_ALLOWED_DESTS applies.
 """
 
@@ -153,7 +153,7 @@ def compose_result_html(req: ResultRequest, max_len: int = MAX_TEXT) -> str:
 
 
 def voice_script(req: ResultRequest) -> str:
-    """About 20 seconds of plain English for Murf."""
+    """About 20 seconds of plain English for Gemini TTS."""
     first = _clean(req.profile.name or "Doctor", 60).split(" ")[0]
     score = _score(req)
     ok, _ = _dx(req)
@@ -201,8 +201,8 @@ async def make_audio(req: ResultRequest) -> tuple[Optional[bytes], str]:
                 lang = "en"
         import rx_audio
 
-        mp3, _, _ = await asyncio.wait_for(rx_audio.synthesize(script, lang), timeout=AUDIO_TIMEOUT_S)
-        return (mp3 or None), lang
+        wav, _, _ = await asyncio.wait_for(rx_audio.synthesize(script, lang), timeout=AUDIO_TIMEOUT_S)
+        return (wav or None), lang
     except HTTPException as e:
         return None, str(e.detail)[:160]
     except Exception as e:  # noqa: BLE001
@@ -264,17 +264,17 @@ async def send_result(req: ResultRequest) -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         log.warning("report card PDF failed: %s", type(e).__name__)
         pdf = None
-    mp3, audio_note = (await make_audio(req)) if req.audio else (None, "not requested")
+    audio_bytes, audio_note = (await make_audio(req)) if req.audio else (None, "not requested")
 
     slug = "".join(ch if ch.isalnum() else "-" for ch in (req.case.id or "case"))[:40].strip("-") or "case"
     document = (f"medsim-report-{slug}.pdf", pdf, "application/pdf", "MedSim report card (training simulation)") if pdf else None
-    audio = ("medsim-result.mp3", mp3, "MedSim result summary") if mp3 else None
+    audio = ("medsim-result.wav", audio_bytes, "MedSim result summary") if audio_bytes else None
     res = await notify.send_telegram_bundle(dest, text, document, audio)
 
     parts = dict(res.get("parts") or {})
     if not pdf:
         parts["document"] = {"ok": False, "error": "PDF generation failed"}
-    if not mp3:
+    if not audio_bytes:
         parts["audio"] = {"ok": False, "skipped": True, "error": audio_note}
     elif "audio" in parts:
         parts["audio"]["lang"] = audio_note

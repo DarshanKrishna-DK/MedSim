@@ -8,6 +8,7 @@ Voice data comes from the live Murf voice list (GET /v1/speech/voices?model=FALC
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import hashlib
 import logging
 from typing import Any, Optional
@@ -15,10 +16,100 @@ from typing import Any, Optional
 log = logging.getLogger("medsim.lang")
 
 LANGS = ("en", "hi", "kn", "ta", "te", "mr", "bn")
-LOCALES = {"en": "en-IN", "hi": "hi-IN", "kn": "kn-IN", "ta": "ta-IN", "te": "te-IN", "mr": "mr-IN", "bn": "bn-IN"}
-LANG_NAMES = {
-    "en": "English", "hi": "Hindi", "kn": "Kannada", "ta": "Tamil", "te": "Telugu", "mr": "Marathi", "bn": "Bengali",
+LOCALES = {
+    "en": "en-IN",
+    "hi": "hi-IN",
+    "kn": "kn-IN",
+    "ta": "ta-IN",
+    "te": "te-IN",
+    "mr": "mr-IN",
+    "bn": "bn-IN",
+    "gu": "gu-IN",
+    "ml": "ml-IN",
+    "pa": "pa-IN",
 }
+LANG_NAMES = {
+    "en": "English",
+    "hi": "Hindi",
+    "kn": "Kannada",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "mr": "Marathi",
+    "bn": "Bengali",
+    "gu": "Gujarati",
+    "ml": "Malayalam",
+    "pa": "Punjabi",
+}
+
+# Prebuilt Google Gemini Live / Gemini TTS voices:
+# Female: Aoede, Kore, Leda, Zephyr
+# Male: Puck, Charon, Fenrir, Orus, Iapetus
+GEMINI_VOICES = {
+    "en": {"F": "Aoede", "M": "Fenrir", "nurse": "Aoede", "examiner": "Charon"},
+    "hi": {"F": "Kore", "M": "Orus", "nurse": "Kore", "examiner": "Charon"},
+    "bn": {"F": "Leda", "M": "Fenrir", "nurse": "Leda", "examiner": "Charon"},
+    "ta": {"F": "Zephyr", "M": "Orus", "nurse": "Zephyr", "examiner": "Charon"},
+    "te": {"F": "Aoede", "M": "Fenrir", "nurse": "Aoede", "examiner": "Charon"},
+    "mr": {"F": "Kore", "M": "Orus", "nurse": "Kore", "examiner": "Charon"},
+    "gu": {"F": "Leda", "M": "Fenrir", "nurse": "Leda", "examiner": "Charon"},
+    "kn": {"F": "Zephyr", "M": "Orus", "nurse": "Zephyr", "examiner": "Charon"},
+    "ml": {"F": "Aoede", "M": "Fenrir", "nurse": "Aoede", "examiner": "Charon"},
+    "pa": {"F": "Kore", "M": "Orus", "nurse": "Kore", "examiner": "Charon"},
+}
+
+
+@dataclass(frozen=True)
+class LanguageConfig:
+    code: str
+    name: str
+    locale: str
+    gemini_voice_f: str
+    gemini_voice_m: str
+    nurse_voice: str
+    examiner_voice: str = "Charon"
+
+    @property
+    def gemini_voice(self) -> str:
+        return self.gemini_voice_f
+
+
+LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
+    code: LanguageConfig(
+        code=code,
+        name=LANG_NAMES.get(code, code),
+        locale=LOCALES.get(code, f"{code}-IN"),
+        gemini_voice_f=v["F"],
+        gemini_voice_m=v["M"],
+        nurse_voice=v["nurse"],
+        examiner_voice=v["examiner"],
+    )
+    for code, v in GEMINI_VOICES.items()
+}
+
+
+def get_lang_config(lang: Optional[str] = None) -> LanguageConfig:
+    """Retrieve LanguageConfig for a language code, falling back to English / en-IN."""
+    code = (lang or "").strip().lower()[:2]
+    return LANGUAGE_CONFIGS.get(code, LANGUAGE_CONFIGS["en"])
+
+
+def supported_languages() -> list[str]:
+    """List of all supported language codes."""
+    return list(LANGUAGE_CONFIGS.keys())
+
+
+def gemini_voice_for(lang: Optional[str], gender: str = "F") -> str:
+    cfg = get_lang_config(lang)
+    return cfg.gemini_voice_f if gender.upper().startswith("F") else cfg.gemini_voice_m
+
+
+def gemini_nurse_voice(lang: Optional[str] = None) -> str:
+    return get_lang_config(lang).nurse_voice
+
+
+def gemini_examiner_voice() -> str:
+    return "Charon"
+
 # Native-script Unicode block per language (Marathi shares Devanagari with Hindi).
 SCRIPT_RANGES = {
     "hi": (0x0900, 0x097F), "mr": (0x0900, 0x097F), "kn": (0x0C80, 0x0CFF),
@@ -294,6 +385,8 @@ async def translate_line(text: str, lang: Optional[str]) -> str:
                 [{"role": "system", "content": sys_msg}, {"role": "user", "content": text}],
                 max_tokens=300,
                 temperature=0.2,
+                tier="fast",
+                effort="low",
             ),
             timeout=8.0,
         )

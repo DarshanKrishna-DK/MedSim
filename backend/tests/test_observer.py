@@ -1,5 +1,5 @@
 """Live faculty observer: invite/join minting, expiry, single-channel codes and
-audience-only token privileges. No network."""
+token verification. No network."""
 
 from __future__ import annotations
 
@@ -17,33 +17,18 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import observer  # noqa: E402
 import server  # noqa: E402
-from agora_token.AccessToken2 import AccessToken, ServiceRtc, ServiceRtm  # noqa: E402
 
-APP_ID = "a" * 32
-CERT = "b" * 32
 HDR = {"Origin": "http://localhost:5173"}
-
-
-def _privs(svc) -> dict:
-    return dict(svc._Service__privileges)  # noqa: SLF001 (vendored token class keeps them private)
 
 
 class ObserverTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._old = {k: os.environ.get(k) for k in ("AGORA_APP_ID", "AGORA_APP_CERTIFICATE")}
-        os.environ["AGORA_APP_ID"] = APP_ID
-        os.environ["AGORA_APP_CERTIFICATE"] = CERT
         observer.reset_state()
         observer.register_session("medsim-im-001-abcd1234", 123456, "im-001", 900001)
         self.client = TestClient(server.app)
 
     def tearDown(self) -> None:
         observer.reset_state()
-        for k, v in self._old.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
 
     def _invite(self, channel: str = "medsim-im-001-abcd1234", case_id: str = "im-001"):
         return self.client.post("/voice/observer/invite", json={"channel": channel, "caseId": case_id}, headers=HDR)
@@ -55,7 +40,6 @@ class ObserverTests(unittest.TestCase):
         self.assertIn(".", body["code"])
         self.assertEqual(body["inviteUrl"], f"http://localhost:5173/?observe={body['code']}")
         self.assertGreaterEqual(body["link"]["uid"], observer.LINK_UID_MIN)
-        self.assertNotIn(CERT, r.text)
         # Codes are random: two invites differ.
         self.assertNotEqual(body["code"], self._invite().json()["code"])
 
@@ -82,29 +66,15 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(j["agentUid"], 900001)
         self.assertNotIn(j["uid"], (123456, 900001, j["linkUid"]))
 
-        tok = AccessToken()
-        self.assertTrue(tok.from_string(j["token"]))
-        self.assertTrue(tok.verify_signature(CERT))
-        rtc = tok.get_services(ServiceRtc.kServiceType)[0]
-        privs = _privs(rtc)
-        self.assertIn(ServiceRtc.kPrivilegeJoinChannel, privs)
-        for p in (
-            ServiceRtc.kPrivilegePublishAudioStream,
-            ServiceRtc.kPrivilegePublishVideoStream,
-            ServiceRtc.kPrivilegePublishDataStream,
-        ):
-            self.assertNotIn(p, privs)
-        self.assertEqual(rtc._ServiceRtc__channel_name, b"medsim-im-001-abcd1234")  # noqa: SLF001
-        self.assertEqual(rtc._ServiceRtc__uid, str(j["uid"]).encode())  # noqa: SLF001
-        rtm = tok.get_services(ServiceRtm.kServiceType)[0]
-        self.assertIn(ServiceRtm.kPrivilegeLogin, _privs(rtm))
+        # Verify token validity
+        self.assertTrue(observer.verify_token(j["token"], j["channel"], j["uid"]))
+        # False for wrong channel or wrong uid
+        self.assertFalse(observer.verify_token(j["token"], "other-channel", j["uid"]))
+        self.assertFalse(observer.verify_token(j["token"], j["channel"], 999999))
 
-    def test_link_token_is_audience_only_too(self):
+    def test_link_token_is_valid(self):
         link = self._invite().json()["link"]
-        tok = AccessToken()
-        tok.from_string(link["token"])
-        privs = _privs(tok.get_services(ServiceRtc.kServiceType)[0])
-        self.assertNotIn(ServiceRtc.kPrivilegePublishAudioStream, privs)
+        self.assertTrue(observer.verify_token(link["token"], "medsim-im-001-abcd1234", link["uid"]))
 
     def test_bad_and_forged_codes_rejected(self):
         code = self._invite().json()["code"]
@@ -130,38 +100,21 @@ class ObserverTests(unittest.TestCase):
             self.assertEqual(self.client.post("/voice/observer/join", json={"code": code}, headers=HDR).status_code, 200)
         self.assertEqual(self.client.post("/voice/observer/join", json={"code": code}, headers=HDR).status_code, 429)
 
-    def test_unconfigured_returns_503(self):
-        os.environ.pop("AGORA_APP_CERTIFICATE", None)
-        self.assertEqual(self._invite().status_code, 503)
-
 
 class VoiceStartRegistersTests(unittest.TestCase):
-    """A channel created by /voice/start (mocked Agora) can be invited to."""
+    """A channel created by /voice/start can be invited to."""
 
     ENV = {
-        "AGORA_APP_ID": APP_ID,
-        "AGORA_APP_CERTIFICATE": CERT,
-        "AGORA_CUSTOMER_ID": "cid",
-        "AGORA_CUSTOMER_SECRET": "csecret",
-        "MURF_API_KEY": "murf",
-        "PATIENT_LLM_PROVIDER": "managed",
+        "GEMINI_API_KEY": "fake-gemini-key",
     }
 
     def setUp(self) -> None:
-        import httpx
-        import voice
-
         self._old = {k: os.environ.get(k) for k in self.ENV}
         os.environ.update(self.ENV)
         observer.reset_state()
-        self._voice = voice
-        self._orig = voice._client_factory
-        handler = lambda req: httpx.Response(200, json={"agent_id": "AG1"})  # noqa: E731
-        voice._client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
         self.client = TestClient(server.app)
 
     def tearDown(self) -> None:
-        self._voice._client_factory = self._orig
         observer.reset_state()
         for k, v in self._old.items():
             if v is None:
@@ -179,6 +132,10 @@ class VoiceStartRegistersTests(unittest.TestCase):
         j = self.client.post("/voice/observer/join", headers=HDR, json={"code": inv.json()["code"]}).json()
         self.assertEqual(j["studentUid"], s["uid"])
         self.assertEqual(j["channel"], s["channel"])
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":

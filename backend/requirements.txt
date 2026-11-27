@@ -1,7 +1,8 @@
-# MedSim backend: FastAPI server (Agora ConvoAI + Murf voice, nurse agent, Managed Agents proxy).
+# MedSim backend: FastAPI server (Gemini Live voice/TTS, nurse agent, Gemini brain).
 fastapi==0.136.1
 uvicorn==0.46.0
 pydantic==2.13.3
-anthropic>=0.88.0
+google-genai>=1.16.0
+websockets>=14.0
 httpx==0.28.1
 slowapi==0.1.9

@@ -1,68 +1,47 @@
-"""Real-time voice: Agora Conversational AI Engine + Murf Falcon TTS.
+"""Real-time voice: Google Gemini Live API WebSockets + Gemini TTS (RIFF WAV).
 
-Endpoints
-  POST /voice/start    create channel, mint tokens, start the ConvoAI agent
-  POST /voice/stop     leave (idempotent)
-  POST /voice/speak    make the agent say a line (farewell)
-  POST /voice/context  replace the agent's LLM system messages (update API)
-  POST /voice/tts      Murf Falcon MP3 (in-room nurse voice)
-
-Verified against docs.agora.io OpenAPI (rest-api.en.yaml):
-  join   POST /v2/projects/{appid}/join
-  leave  POST /v2/projects/{appid}/agents/{id}/leave
-  speak  POST /v2/projects/{appid}/agents/{id}/speak  {text, priority, interruptable}
-  update POST /v2/projects/{appid}/agents/{id}/update {properties:{llm:{system_messages}}}
-Murf docs: Agora tts params {api_key, voiceId, locale, model, sample_rate};
-Murf HTTP stream: POST https://global.api.murf.ai/v1/speech/stream, header api-key.
-
-Secrets are read from the environment per call and never logged/returned.
+Endpoints:
+  GET  /voice/config   health and active voice transport status
+  POST /voice/start    prepare Gemini Live session, mint tokens
+  POST /voice/stop     close live session (idempotent)
+  POST /voice/speak    speak a line into active session
+  POST /voice/context  update session prompt or agent context
+  POST /voice/update   alias for /voice/context
+  GET  /voice/metrics  realtime token/turn metrics
+  GET  /voice/status   active session stats
+  POST /voice/tts      Gemini TTS RIFF WAV audio
+  WS   /voice/live/{channel}  WebSocket bridge to Google Gemini Live API
 """
 
 from __future__ import annotations
 
-import base64
 import copy
-import hashlib
 import logging
 import os
 import secrets
 import time
 from typing import Any, Literal, Optional
 
-import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
-from agora_token import RtcTokenBuilder, Role_Publisher
-from llm_provider import require_provider
-import observer
-import llm_proxy
+import gemini_live
+import gemini_tts
 import lang as langmod
+import observer
 import viva
 
 log = logging.getLogger("medsim.voice")
 router = APIRouter()
+router.include_router(gemini_live.router)
 
-AGORA_API = "https://api.agora.io/api/conversational-ai-agent/v2/projects"
-MURF_STREAM_URL = "https://global.api.murf.ai/v1/speech/stream"
 AGENT_UID = 900001
-TOKEN_TTL_S = 7200 * 2  # >=2h: short tokens dropped long sessions
-AGENT_IDLE_TIMEOUT_S = 45  # was 120; see build_join_body
+AVATAR_UID = 900002
+TOKEN_TTL_S = 7200 * 2
+AGENT_IDLE_TIMEOUT_S = 45
 
-# Verified via GET https://api.murf.ai/v1/speech/voices?model=falcon-2.1
-# (header `api-key`; NOT available on global.api.murf.ai). Override via env.
-DEFAULT_VOICES = {"M": "en-IN-aarav", "F": "en-IN-priya", "nurse": "en-IN-anisha"}
-
-# Indian English Falcon voices (listed live from the voices API, 2026-11-20).
-# Patients get a stable voice per case so two patients rarely sound alike.
-# Per-language pools (hi-IN / kn-IN support) live in lang.py.
-PATIENT_VOICE_POOLS = langmod.PATIENT_VOICE_POOLS["en"]
-
-
-def _client_factory() -> httpx.AsyncClient:
-    """Indirection so tests can inject a mock transport."""
-    return httpx.AsyncClient(timeout=20.0)
+DEFAULT_VOICES = {"M": "Puck", "F": "Aoede", "nurse": "Aoede"}
 
 
 def _require_env(*names: str) -> dict[str, str]:
@@ -73,165 +52,32 @@ def _require_env(*names: str) -> dict[str, str]:
 
 
 def voice_health() -> dict[str, Any]:
-    def has(n: str) -> bool:
-        return bool(os.environ.get(n, "").strip())
-
+    key = gemini_tts._get_api_key()
     return {
-        "transport": "agora",
-        "agora_configured": has("AGORA_APP_ID") and has("AGORA_APP_CERTIFICATE"),
-        "agora_convoai_configured": has("AGORA_CUSTOMER_ID") and has("AGORA_CUSTOMER_SECRET"),
-        "murf_configured": has("MURF_API_KEY"),
+        "transport": "gemini_live",
+        "gemini_configured": bool(key),
+        "gemini_live_configured": bool(key),
+        "gemini_tts_configured": bool(key),
+        "model": os.environ.get("GEMINI_LIVE_MODEL", gemini_live.DEFAULT_LIVE_MODEL),
+        "tts_model": os.environ.get("GEMINI_TTS_MODEL", gemini_tts.DEFAULT_TTS_MODEL),
+        "active_sessions": gemini_live.active_session_count(),
     }
+
+
+@router.get("/voice/config")
+def voice_config() -> dict[str, Any]:
+    return voice_health()
 
 
 RECEPTIONIST_CASE_ID = "receptionist"
-RECEPTIONIST_VOICE = "en-IN-priya"
 
 
 def _voice_for(kind: str, case_id: str | None = None, lang: str | None = "en") -> str:
-    """Murf voice id. English honours the MURF_* env overrides; hi/kn always pick
-    from voices that list the locale (an override could lack hi-IN/kn-IN support)."""
-    lg = langmod.norm_lang(lang)
-    if case_id == viva.VIVA_CASE_ID:
-        return viva.examiner_voice(lg)
-    if case_id == RECEPTIONIST_CASE_ID:
-        # Priya at Reception: a female Indian Murf voice (en-IN-priya lists hi-IN too).
-        return RECEPTIONIST_VOICE if lg in ("en", "hi") else langmod.nurse_voice(lg)
-    if lg == "en":
-        env = {"M": "MURF_VOICE_MALE", "F": "MURF_VOICE_FEMALE", "nurse": "MURF_NURSE_VOICE"}[kind]
-        override = os.environ.get(env, "").strip()
-        if override:
-            return override
-    if kind == "nurse":
-        return langmod.nurse_voice(lg)
-    if case_id:
-        return langmod.pick_patient_voice(lg, kind, case_id)
-    return DEFAULT_VOICES[kind] if lg == "en" else langmod.pick_patient_voice(lg, kind, None)
-
-
-def _basic_auth() -> str:
-    e = _require_env("AGORA_CUSTOMER_ID", "AGORA_CUSTOMER_SECRET")
-    raw = f"{e['AGORA_CUSTOMER_ID']}:{e['AGORA_CUSTOMER_SECRET']}".encode()
-    return "Basic " + base64.b64encode(raw).decode()
-
-
-def _agora_headers() -> dict[str, str]:
-    return {"Authorization": _basic_auth(), "Content-Type": "application/json"}
-
-
-def _rtc_rtm_token(app_id: str, cert: str, channel: str, uid: int) -> str:
-    return RtcTokenBuilder.build_token_with_rtm(
-        app_id, cert, channel, str(uid), Role_Publisher, TOKEN_TTL_S, TOKEN_TTL_S
-    )
-
-
-# Spoken by Agora when the LLM call fails: a human "say that again?", per language in lang.py.
-FAILURE_MESSAGE = langmod.failure_message("en")
-
-# Noise-robust turn detection (field names per Agora /join reference).
-# Tuned for a natural conversation: the doctor can barge in after ~0.2 s of real
-# speech (interrupt_duration_ms, was 240), and the patient answers after ~0.56 s
-# of silence (silence_duration_ms, was 640). 560 ms still sits above the usual
-# mid-sentence pause, so loose, thinking-aloud questions are not cut off.
-# speech_threshold stays 0.6 so clinic background noise does not count as speech.
-TURN_DETECTION = {
-    "mode": "default",
-    "config": {
-        "speech_threshold": 0.6,
-        "start_of_speech": {
-            "mode": "vad",
-            "vad_config": {"interrupt_duration_ms": 200, "prefix_padding_ms": 800},
-        },
-        "end_of_speech": {"mode": "vad", "vad_config": {"silence_duration_ms": 560}},
-    },
-}
-
-
-# Agora "talking while waiting" fillers (properties.filler_words, join reference).
-# Static only: generated fillers need a BYOK OpenAI/Groq/xAI LLM, ours is custom/Sarvam.
-# Phrases per language live in lang.py (FILLERS).
-FILLER_PHRASES = langmod.FILLERS["en"]
-FILLER_WAIT_MS = 1100
-
-
-def filler_block(lang: str | None = "en", case_id: str | None = None) -> dict[str, Any]:
-    phrases = viva.examiner_fillers(lang) if case_id == viva.VIVA_CASE_ID else langmod.fillers(lang)
-    return {
-        "enable": True,
-        "trigger": {"fixed_time_config": {"response_wait_ms": FILLER_WAIT_MS}},
-        "content": {
-            "mode": "static",
-            "static_config": {"phrases": phrases, "selection_rule": "shuffle"},
-        },
-    }
-
-
-def _llm_block(
-    system_prompt: str, greeting: str, *, probe: bool = False, lang: str | None = "en",
-    token_meta: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    """PATIENT_LLM_PROVIDER = sarvam (default) | groq | managed (Agora-managed
-    OpenAI, no key needed). sarvam/groq fall back to the other if unconfigured.
-
-    When a verified public URL exists, Agora calls our /llm proxy (which cleans
-    blank noise turns and holds the real key) with a per-agent bearer token.
-    token_meta tags that token (e.g. {"kind": "followup", ...}) so the proxy
-    can run Asha's tools for follow-up calls."""
-    if (os.environ.get("PATIENT_LLM_PROVIDER") or "").strip().lower() == "managed":
-        return {
-            "credential_mode": "managed",
-            "vendor": "openai",
-            "style": "openai",
-            "url": "https://api.openai.com/v1/chat/completions",
-            "system_messages": [{"role": "system", "content": system_prompt}],
-            "greeting_message": greeting,
-            "failure_message": langmod.failure_message(lang),
-            "max_history": 32,
-            "params": {"model": "gpt-4.1-mini", "max_tokens": 300},
-        }
-    prov = require_provider()
-    common = {
-        "style": "openai",
-        "system_messages": [{"role": "system", "content": system_prompt}],
-        "greeting_message": greeting,
-        "failure_message": langmod.failure_message(lang),
-        "max_history": 32,
-        "params": {"model": prov["model"], "max_tokens": 300, "temperature": 0.7},
-    }
-    pub = llm_proxy.public_url()
-    if pub:
-        return {
-            "vendor": "custom",
-            "url": pub + llm_proxy.PROXY_PATH,
-            "api_key": "probe" if probe else llm_proxy.mint_token(token_meta),
-            **common,
-        }
-    return {"url": prov["url"], "api_key": prov["api_key"], **common}
-
-
-async def _agora_call(method: str, path: str, body: Optional[dict] = None) -> httpx.Response:
-    app_id = _require_env("AGORA_APP_ID")["AGORA_APP_ID"]
-    url = f"{AGORA_API}/{app_id}{path}"
-    try:
-        async with _client_factory() as c:
-            return await c.request(method, url, json=body, headers=_agora_headers())
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Agora request failed: {type(e).__name__}")
-
-
-def _agora_fail(r: httpx.Response, what: str) -> HTTPException:
-    return HTTPException(status_code=502, detail=f"Agora {what} failed ({r.status_code}): {r.text[:800]}")
-
-
-AVATAR_UID = 900002
-# Murf sample_rate each avatar vendor needs (Agora avatar docs). Anam accepts
-# 16/24/48k and we ask it for 24k, so Murf stays at 24k for anam and liveavatar.
-AVATAR_SAMPLE_RATES = {"anam": 24000, "liveavatar": 24000, "heygen": 24000, "akool": 16000}
-AVATAR_DEFAULT_CASES = {"teacher"}  # one avatar (Anam free tier): the Teacher Portal only
+    """Gemini voice selection."""
+    return gemini_tts.pick_voice_for_role(kind, case_id, lang)
 
 
 def avatar_config() -> Optional[dict[str, str]]:
-    """Avatar settings from env, or None when not configured (feature off)."""
     vendor = os.environ.get("AVATAR_VENDOR", "").strip().lower()
     key = os.environ.get("AVATAR_API_KEY", "").strip()
     if not vendor or not key:
@@ -248,24 +94,8 @@ def want_avatar(req: "VoiceStartRequest") -> bool:
     if avatar_config() is None:
         return False
     if req.avatar is None:
-        return req.caseId in AVATAR_DEFAULT_CASES
+        return req.caseId in {"teacher"}
     return req.avatar
-
-
-def avatar_block(cfg: dict[str, str], avatar_token: str) -> dict[str, Any]:
-    params: dict[str, Any] = {
-        "api_key": cfg["api_key"],
-        "agora_uid": str(AVATAR_UID),
-        "agora_token": avatar_token,
-    }
-    if cfg["avatar_id"]:
-        params["avatar_id"] = cfg["avatar_id"]
-    vendor = cfg["vendor"]
-    if vendor in ("anam", "liveavatar", "heygen"):
-        params["quality"] = cfg["quality"]
-    if vendor == "anam":
-        params["sample_rate"] = AVATAR_SAMPLE_RATES["anam"]
-    return {"enable": True, "vendor": vendor, "params": params}
 
 
 class VoiceStartRequest(BaseModel):
@@ -275,88 +105,67 @@ class VoiceStartRequest(BaseModel):
     gender: Literal["M", "F"] = "M"
     locale: Optional[str] = None
     avatar: Optional[bool] = None
-    # Autonomous agents (receptionist / teacher / viva-examiner): what their
-    # server-side tools may act on, e.g. {assignmentCode, knownCodes, profile}.
-    # Whitelisted and size-limited per kind in agent_runtime.clean_ctx.
     agentContext: Optional[dict[str, Any]] = None
 
 
-# Sessions whose live agent runs its own tools inside our custom LLM endpoint
-# (agent_runtime / agent_toolsets). Needs the proxy route (PUBLIC_URL or tunnel).
 AUTONOMOUS_CASES = ("receptionist", "teacher", viva.VIVA_CASE_ID)
 
 
 class VoiceStartResponse(BaseModel):
-    appId: str
-    channel: str
-    uid: int
-    token: str
-    agentUid: int
-    agentId: str
+    ok: bool = True
+    appId: str = "gemini-live"
+    app_id: str = "gemini-live"
+    channel: str = ""
+    uid: int = 0
+    token: str = ""
+    agentUid: int = AGENT_UID
+    agent_uid: int = AGENT_UID
+    agentId: str = ""
+    agent_id: str = ""
+    mode: str = "gemini_live"
+    model: str = "gemini-3.8-live"
+    wsUrl: str = ""
+    ws_url: str = ""
+    observerWsUrl: str = ""
+    observer_ws_url: str = ""
+    observerToken: str = ""
+    observer_token: str = ""
+    sampleRateIn: int = 16000
+    sample_rate_in: int = 16000
+    sampleRateOut: int = 24000
+    sample_rate_out: int = 24000
     avatarUid: Optional[int] = None
+    avatar_uid: Optional[int] = None
     avatarError: Optional[str] = None
-    # True when the agent's tools run server-side (the client then drops its
-    # keyword triggers and polls /agent/agent-events/{channel}).
-    toolsEnabled: Optional[bool] = None
+    avatar_error: Optional[str] = None
+    toolsEnabled: Optional[bool] = True
+    tools_enabled: Optional[bool] = True
 
-
-def build_join_body(
-    req: VoiceStartRequest,
-    channel: str,
-    user_uid: int,
-    agent_token: str,
-    murf_key: str,
-    avatar_token: Optional[str] = None,
-    *,
-    voice_kind: Optional[str] = None,
-    idle_timeout: int = AGENT_IDLE_TIMEOUT_S,
-    llm_token_meta: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    """Agora /join body. voice_kind overrides req.gender for the Murf voice
-    ('nurse' for Asha's follow-up call); idle_timeout is the post-leave linger."""
-    lang = langmod.norm_lang(req.locale)
-    locale = langmod.locale_for(lang)
-    sarvam_key = os.environ.get("SARVAM_API_KEY", "").strip()
-    asr: dict[str, Any] = (
-        {"vendor": "sarvam", "params": {"api_key": sarvam_key, "language": "unknown"}}
-        if sarvam_key and os.environ.get("VOICE_ASR", "sarvam").lower() == "sarvam"
-        else {"vendor": "ares", "language": locale}
-    )
-    cfg = avatar_config() if avatar_token else None
-    body = {
-        "name": f"medsim-{secrets.token_hex(6)}",
-        "properties": {
-            "channel": channel,
-            "token": agent_token,
-            "agent_rtc_uid": str(AGENT_UID),
-            "remote_rtc_uids": [str(user_uid)],
-            # Seconds the agent lingers after the doctor leaves the channel. Kept
-            # short so a crashed tab or lost /voice/stop burns few ConvoAI minutes.
-            "idle_timeout": idle_timeout,
-            "advanced_features": {"enable_rtm": True},
-            "parameters": {"data_channel": "rtm", "enable_error_message": True, "enable_metrics": True},
-            "asr": asr,
-            "llm": _llm_block(req.systemPrompt, req.initialLine, lang=lang, token_meta=llm_token_meta),
-            "turn_detection": copy.deepcopy(TURN_DETECTION),
-            "filler_words": filler_block(lang, req.caseId),
-            "tts": {
-                "vendor": "murf",
-                "params": {
-                    "api_key": murf_key,
-                    "base_url": "wss://global.api.murf.ai/v1/speech/stream-input",
-                    "voiceId": _voice_for(voice_kind or req.gender, req.caseId, lang),
-                    "model": os.environ.get("MURF_AGORA_MODEL", "").strip() or "FALCON",
-                    "locale": locale,
-                    "rate": 0,
-                    "pitch": 0,
-                    "sample_rate": AVATAR_SAMPLE_RATES.get(cfg["vendor"], 24000) if cfg else 24000,
-                },
-            },
-        },
-    }
-    if cfg and avatar_token:
-        body["properties"]["avatar"] = avatar_block(cfg, avatar_token)
-    return body
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        d = dict(data)
+        pairs = [
+            ("appId", "app_id"),
+            ("agentUid", "agent_uid"),
+            ("agentId", "agent_id"),
+            ("wsUrl", "ws_url"),
+            ("observerWsUrl", "observer_ws_url"),
+            ("observerToken", "observer_token"),
+            ("sampleRateIn", "sample_rate_in"),
+            ("sampleRateOut", "sample_rate_out"),
+            ("avatarUid", "avatar_uid"),
+            ("avatarError", "avatar_error"),
+            ("toolsEnabled", "tools_enabled"),
+        ]
+        for camel, snake in pairs:
+            if camel in d and snake not in d:
+                d[snake] = d[camel]
+            elif snake in d and camel not in d:
+                d[camel] = d[snake]
+        return d
 
 
 async def start_agent_session(
@@ -370,64 +179,77 @@ async def start_agent_session(
     agent_kind: Optional[str] = None,
     agent_ctx: Optional[dict[str, Any]] = None,
 ) -> VoiceStartResponse:
-    """Mint RTC+RTM tokens, start one ConvoAI agent and return the session.
-    Shared by /voice/start (patient persona) and the follow-up call (Asha).
-    agent_kind tags the LLM token for an autonomous agent (tools + ctx)."""
-    env = _require_env(
-        "AGORA_APP_ID", "AGORA_APP_CERTIFICATE", "AGORA_CUSTOMER_ID", "AGORA_CUSTOMER_SECRET", "MURF_API_KEY"
-    )
-    _llm_block("", "", probe=True)  # fail fast (503) if no LLM configured
-    app_id, cert = env["AGORA_APP_ID"], env["AGORA_APP_CERTIFICATE"]
+    """Prepare a Gemini Live session, mint tokens, and return connection details."""
+    key = gemini_tts._get_api_key()
+    if not key:
+        raise HTTPException(status_code=503, detail="Voice not configured: missing GEMINI_API_KEY")
+
     safe_case = "".join(ch for ch in req.caseId if ch.isalnum() or ch in "-_")[:24] or "case"
     channel = f"{channel_prefix}-{safe_case}-{secrets.token_hex(4)}"
-    if agent_kind and llm_token_meta is None:
-        llm_token_meta = {"kind": agent_kind, "ctx": dict(agent_ctx or {}), "channel": channel,
-                          "lang": langmod.norm_lang(req.locale)}
-    user_uid = secrets.randbelow(900000) + 100000
-    user_token = _rtc_rtm_token(app_id, cert, channel, user_uid)
-    agent_token = _rtc_rtm_token(app_id, cert, channel, AGENT_UID)
 
-    # hi/kn: the opening line arrives in English (case chief complaint); speak it in the session language.
-    if translate_greeting and langmod.norm_lang(req.locale) != "en":
-        req = req.model_copy(update={"initialLine": await langmod.translate_line(req.initialLine, req.locale)})
-    avatar_token = _rtc_rtm_token(app_id, cert, channel, AVATAR_UID) if want_avatar(req) else None
-    body = build_join_body(
-        req, channel, user_uid, agent_token, env["MURF_API_KEY"], avatar_token, voice_kind=voice_kind, idle_timeout=idle_timeout,
+    lang = langmod.norm_lang(req.locale)
+    voice_name = gemini_tts.pick_voice_for_role(voice_kind or req.gender, req.caseId, lang)
+
+    user_uid = secrets.randbelow(900000) + 100000
+
+    # Translate opening greeting if required
+    initial_line = req.initialLine
+    if translate_greeting and lang != "en":
+        try:
+            initial_line = await langmod.translate_line(initial_line, req.locale)
+        except Exception:
+            pass
+
+    # Register prepared live session
+    live_token = gemini_live.register_prepared_session(
+        channel=channel,
+        case_id=req.caseId,
+        system_prompt=req.systemPrompt,
+        initial_line=initial_line,
+        voice=voice_name,
+        locale=lang,
+        agent_kind=agent_kind or (req.caseId if req.caseId in AUTONOMOUS_CASES else None),
+        agent_ctx=agent_ctx or req.agentContext,
         llm_token_meta=llm_token_meta,
     )
-    r = await _agora_call("POST", "/join", body)
-    avatar_error: Optional[str] = None
-    if avatar_token and 400 <= r.status_code < 500:
-        # The avatar is optional polish: retry without it so the call still works.
-        avatar_error = f"Agora rejected the avatar ({r.status_code}): {r.text[:200]}"
-        log.warning(avatar_error)
-        body = build_join_body(
-            req, channel, user_uid, agent_token, env["MURF_API_KEY"], None, voice_kind=voice_kind, idle_timeout=idle_timeout,
-            llm_token_meta=llm_token_meta,
-        )
-        r = await _agora_call("POST", "/join", body)
-    if 400 <= r.status_code < 500 and "filler" in r.text.lower():
-        # Fillers are polish: never let them block the call.
-        log.warning("Agora rejected filler_words (%s); retrying join without it", r.status_code)
-        body["properties"].pop("filler_words", None)
-        r = await _agora_call("POST", "/join", body)
-    if r.status_code != 200:
-        raise _agora_fail(r, "join")
-    try:
-        agent_id = r.json()["agent_id"]
-    except Exception:  # noqa: BLE001
-        raise _agora_fail(r, "join (no agent_id)")
+
+    # Register with observer hub
     observer.register_session(channel, user_uid, req.caseId, AGENT_UID)
-    llm = body["properties"]["llm"]
-    tools_enabled: Optional[bool] = None
-    if agent_kind:
-        tools_enabled = llm.get("vendor") == "custom"
-        if tools_enabled:
-            llm_proxy.bind_agent(agent_id, str(llm.get("api_key") or ""))
+    obs_token = observer.mint_token(channel, user_uid)
+
+    ws_url = f"/voice/live/{channel}?token={live_token}"
+    obs_ws_url = f"/voice/observer/ws?channel={channel}&uid={user_uid}&token={obs_token}"
+    model = os.environ.get("GEMINI_LIVE_MODEL", gemini_live.DEFAULT_LIVE_MODEL)
+
+    has_avatar = want_avatar(req)
+
     return VoiceStartResponse(
-        appId=app_id, channel=channel, uid=user_uid, token=user_token, agentUid=AGENT_UID, agentId=agent_id,
-        avatarUid=AVATAR_UID if avatar_token and not avatar_error else None, avatarError=avatar_error,
-        toolsEnabled=tools_enabled,
+        ok=True,
+        appId="gemini-live",
+        app_id="gemini-live",
+        channel=channel,
+        uid=user_uid,
+        token=live_token,
+        agentUid=AGENT_UID,
+        agent_uid=AGENT_UID,
+        agentId=channel,
+        agent_id=channel,
+        mode="gemini_live",
+        model=model,
+        wsUrl=ws_url,
+        ws_url=ws_url,
+        observerWsUrl=obs_ws_url,
+        observer_ws_url=obs_ws_url,
+        observerToken=obs_token,
+        observer_token=obs_token,
+        sampleRateIn=16000,
+        sample_rate_in=16000,
+        sampleRateOut=24000,
+        sample_rate_out=24000,
+        avatarUid=AVATAR_UID if has_avatar else None,
+        avatar_uid=AVATAR_UID if has_avatar else None,
+        toolsEnabled=True,
+        tools_enabled=True,
     )
 
 
@@ -445,24 +267,13 @@ async def voice_start(req: VoiceStartRequest):
 
 
 async def leave_agent(agent_id: str) -> bool:
-    """Stop an agent. True when it stopped or was already gone (idempotent)."""
-    r = await _agora_call("POST", f"/agents/{agent_id}/leave")
-    if r.status_code == 200:
-        return True
-    t = r.text.lower()
-    if r.status_code in (404, 410) or any(k in t for k in ("not found", "not exist", "invalidrequestbody", "shutting down", "conflict")):
-        return True
-    raise _agora_fail(r, "leave")
+    """Stop an agent session. Idempotent."""
+    return await gemini_live.stop_session(agent_id)
 
 
 async def speak_line(agent_id: str, text: str, priority: str = "INTERRUPT", interruptable: bool = True) -> None:
-    r = await _agora_call(
-        "POST",
-        f"/agents/{agent_id}/speak",
-        {"text": text.encode()[:500].decode(errors="ignore"), "priority": priority, "interruptable": interruptable},
-    )
-    if r.status_code != 200:
-        raise _agora_fail(r, "speak")
+    """Make the agent speak a line."""
+    await gemini_live.speak_in_session(agent_id, text, priority, interruptable)
 
 
 class AgentRef(BaseModel):
@@ -471,18 +282,12 @@ class AgentRef(BaseModel):
 
 @router.post("/voice/stop")
 async def voice_stop(request: Request):
-    # navigator.sendBeacon posts text/plain; accept JSON text under any content type.
     try:
         req = AgentRef.model_validate_json(await request.body())
-    except Exception:  # noqa: BLE001
+    except Exception:
         raise HTTPException(status_code=422, detail="body must be JSON {agentId}")
-    r = await _agora_call("POST", f"/agents/{req.agentId}/leave")
-    if r.status_code == 200:
-        return {"ok": True}
-    # Already gone / unknown id => treat as stopped (idempotent).
-    if r.status_code in (404, 410) or "not found" in r.text.lower() or "not exist" in r.text.lower() or "invalidrequestbody" in r.text.lower() or "shutting down" in r.text.lower() or "conflict" in r.text.lower():
-        return {"ok": True, "alreadyStopped": True}
-    raise _agora_fail(r, "leave")
+    stopped = await gemini_live.stop_session(req.agentId)
+    return {"ok": True, "stopped": stopped}
 
 
 class VoiceSpeakRequest(BaseModel):
@@ -494,99 +299,72 @@ class VoiceSpeakRequest(BaseModel):
 
 @router.post("/voice/speak")
 async def voice_speak(req: VoiceSpeakRequest):
-    r = await _agora_call(
-        "POST",
-        f"/agents/{req.agentId}/speak",
-        {"text": req.text.encode()[:500].decode(errors="ignore"), "priority": req.priority, "interruptable": req.interruptable},
-    )
-    if r.status_code != 200:
-        raise _agora_fail(r, "speak")
+    await gemini_live.speak_in_session(req.agentId, req.text, req.priority, req.interruptable)
     return {"ok": True}
 
 
 class VoiceContextRequest(BaseModel):
     agentId: str
     systemPrompt: Optional[str] = None
-    # Autonomous agents: keys merged into the ctx their tools read (validated per kind).
     agentContext: Optional[dict[str, Any]] = None
 
 
 def update_agent_ctx(agent_id: str, patch: dict[str, Any]) -> bool:
-    """Merge a validated ctx patch into a tool-enabled agent's token meta. False when not tool-enabled."""
-    import agent_runtime
-
-    tok = llm_proxy.agent_token(agent_id)
-    meta = llm_proxy.token_meta(tok) if tok else None
-    if not meta or "ctx" not in meta:
-        return False
-    kind = str(meta.get("kind"))
-    merged = {**meta["ctx"], **agent_runtime.clean_ctx(kind, patch)}
-    return llm_proxy.update_token_ctx(agent_id, agent_runtime.clean_ctx(kind, merged))
+    """Merge a validated ctx patch into session context."""
+    import asyncio
+    asyncio.create_task(gemini_live.update_session_context(agent_id, agent_ctx=patch))
+    return True
 
 
 @router.post("/voice/context")
+@router.post("/voice/update")
 async def voice_context(req: VoiceContextRequest):
-    """Best effort: the update API documents `properties.llm.system_messages`
-    as runtime-updatable. Fails with 502 (Agora body) if the engine rejects it;
-    the frontend should treat that as non-fatal. agentContext (optional)
-    updates what an autonomous agent's tools act on, without an Agora call."""
-    ctx_updated: Optional[bool] = None
-    if req.agentContext is not None:
-        try:
-            ctx_updated = update_agent_ctx(req.agentId, req.agentContext)
-        except ValueError as e:
-            raise HTTPException(status_code=422, detail=str(e))
-    if req.systemPrompt is None:
-        return {"ok": True, "ctxUpdated": bool(ctx_updated)}
-    r = await _agora_call(
-        "POST",
-        f"/agents/{req.agentId}/update",
-        {"properties": {"llm": {"system_messages": [{"role": "system", "content": req.systemPrompt}]}}},
+    updated = await gemini_live.update_session_context(
+        req.agentId,
+        system_prompt=req.systemPrompt,
+        agent_ctx=req.agentContext,
     )
-    if r.status_code != 200:
-        raise _agora_fail(r, "update")
-    return {"ok": True} if ctx_updated is None else {"ok": True, "ctxUpdated": ctx_updated}
+    return {"ok": True, "ctxUpdated": updated}
+
+
+@router.get("/voice/metrics")
+async def voice_metrics(agentId: Optional[str] = None):
+    if agentId:
+        return gemini_live.get_session_metrics(agentId)
+    return {"active_sessions": gemini_live.active_session_count()}
+
+
+@router.get("/voice/status")
+async def voice_status():
+    return {
+        "ok": True,
+        "mode": "gemini_live",
+        "active_sessions": gemini_live.active_session_count(),
+    }
 
 
 class VoiceTtsRequest(BaseModel):
     text: str
     voice: Literal["nurse", "M", "F"] = "nurse"
     locale: Optional[str] = None
-    # Backup voice engine: pass the case id + speaker gender to get the same
-    # pooled Murf voice the Agora path (/voice/start) would use for this case.
     caseId: Optional[str] = None
     gender: Optional[Literal["M", "F"]] = None
 
 
 def tts_voice_and_locale(req: VoiceTtsRequest) -> tuple[str, str]:
-    """(Murf voiceId, locale) for a /voice/tts request. With caseId the voice
-    matches build_join_body's pick for the same case, gender and language."""
     lang = langmod.norm_lang(req.locale)
-    if req.caseId and req.voice != "nurse" or req.gender:
-        kind = req.gender or (req.voice if req.voice in ("M", "F") else "M")
-        return _voice_for(kind, req.caseId or None, lang), langmod.locale_for(lang)
-    voice_id = _voice_for(req.voice, None, lang)
-    locale = ("en-US" if req.voice == "nurse" else "en-IN") if lang == "en" else langmod.locale_for(lang)
-    return voice_id, locale
+    role = req.gender or (req.voice if req.voice in ("M", "F") else "nurse")
+    voice_name = gemini_tts.pick_voice_for_role(role, req.caseId, lang)
+    locale = langmod.locale_for(lang)
+    return voice_name, locale
 
 
 @router.post("/voice/tts")
 async def voice_tts(req: VoiceTtsRequest):
-    key = _require_env("MURF_API_KEY")["MURF_API_KEY"]
-    voice_id, locale = tts_voice_and_locale(req)
-    body = {
-        "text": req.text[:600],
-        "voiceId": voice_id,
-        "model": "falcon-2.1",
-        "format": "MP3",
-        "sampleRate": 24000,
-        "locale": locale,
-    }
+    voice_name, _locale = tts_voice_and_locale(req)
     try:
-        async with _client_factory() as c:
-            r = await c.post(MURF_STREAM_URL, json=body, headers={"api-key": key})
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Murf request failed: {type(e).__name__}")
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Murf TTS failed ({r.status_code}): {r.text[:300]}")
-    return Response(content=r.content, media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
+        wav_bytes, _mime = await gemini_tts.synthesize_speech(req.text, voice=voice_name)
+    except Exception as e:
+        log.warning("Voice TTS error: %s", e)
+        raise HTTPException(status_code=502, detail=f"Gemini TTS failed: {type(e).__name__}: {e}")
+    return Response(content=wav_bytes, media_type="audio/wav", headers={"Cache-Control": "no-store"})

@@ -1,5 +1,6 @@
 # Dependencies and build output
 node_modules/
+.pnpm-store/
 dist/
 .vite/
 tsconfig.tsbuildinfo
@@ -7,8 +8,11 @@ tsconfig.tsbuildinfo
 
 # Secrets (backend/.env.example stays tracked as the template)
 .env
+.env.*
 .env.local
 .env.*.local
+!.env.example
+!backend/.env.example
 *.pem
 *.key
 
@@ -25,7 +29,10 @@ docs/
 
 # Python backend
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+venv/
+.venv/
 backend/.venv/
 backend/.venv-voice/
 backend/samples/*.wav
@@ -41,5 +48,10 @@ desktop.ini
 CLAUDE.md
 *.jsonl
 
-# Deployment notes live in the README (render.yaml is the real config)
-DEPLOY.md
+# Tracked Gemini & Cloud Run governance and deployment configs
+!GEMINI.md
+!DEPLOY.md
+!.gcloudignore
+!.agents/
+!.agents/rules/
+!.agents/rules/**

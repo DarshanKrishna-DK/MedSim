@@ -15,129 +15,105 @@ if str(_B) not in sys.path:
 import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+import debrief  # noqa: E402
+import gemini_live  # noqa: E402
+import gemini_tts  # noqa: E402
+import nurse  # noqa: E402
 import server  # noqa: E402
 import voice  # noqa: E402
-import nurse  # noqa: E402
-import debrief  # noqa: E402
 
 SECRETS = {
-    "AGORA_APP_ID": "a" * 32,
-    "AGORA_APP_CERTIFICATE": "b" * 32,
-    "AGORA_CUSTOMER_ID": "cust-id-zz",
-    "AGORA_CUSTOMER_SECRET": "cust-secret-zz",
-    "MURF_API_KEY": "murf-key-zz",
-    "SARVAM_API_KEY": "sarvam-key-zz",
+    "GEMINI_API_KEY": "fake-gemini-key-voice-nurse",
 }
 HDR = {"Origin": "http://localhost:5173"}
 
 
 class VoiceStartTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._old = {k: os.environ.get(k) for k in [*SECRETS, "PATIENT_LLM_PROVIDER", "VOICE_ASR"]}
+        self._old = {k: os.environ.get(k) for k in [*SECRETS, "GEMINI_LIVE_MODEL"]}
         os.environ.update(SECRETS)
-        os.environ["PATIENT_LLM_PROVIDER"] = "sarvam"
-        os.environ.pop("VOICE_ASR", None)
-        self.calls: list[httpx.Request] = []
-
-        def handler(req: httpx.Request) -> httpx.Response:
-            self.calls.append(req)
-            if req.url.path.endswith("/join"):
-                return httpx.Response(200, json={"agent_id": "AGENT123", "status": "RUNNING"})
-            if req.url.path.endswith("/leave"):
-                return httpx.Response(404, json={"detail": "not found"})
-            return httpx.Response(200, json={})
-
-        self._orig = voice._client_factory
-        voice._client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
         self.client = TestClient(server.app)
 
     def tearDown(self) -> None:
-        voice._client_factory = self._orig
         for k, v in self._old.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
 
-    def test_start_builds_murf_openai_sarvam_body_and_hides_keys(self) -> None:
+    def test_start_builds_gemini_live_session_and_hides_keys(self) -> None:
         r = self.client.post("/voice/start", headers=HDR, json={
-            "caseId": "case 1", "systemPrompt": "You are Raj.", "initialLine": "Hi doc", "gender": "F"})
+            "caseId": "case 1", "systemPrompt": "You are Raj.", "initialLine": "Hi doc", "gender": "F"
+        })
         self.assertEqual(r.status_code, 200, r.text)
         data = r.json()
-        self.assertEqual(set(data), {"appId", "channel", "uid", "token", "agentUid", "agentId"})
-        self.assertEqual(data["agentId"], "AGENT123")
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["mode"], "gemini_live")
+        self.assertEqual(data["model"], "gemini-3.8-live")
         self.assertTrue(data["channel"].startswith("medsim-case1-"))
         self.assertTrue(100000 <= data["uid"] <= 999999)
+        self.assertEqual(data["sampleRateIn"], 16000)
+        self.assertEqual(data["sampleRateOut"], 24000)
+        self.assertIn("/voice/live/", data["wsUrl"])
+        self.assertIn("/voice/observer/ws", data["observerWsUrl"])
+        self.assertTrue(data["token"])
+        self.assertTrue(data["observerToken"])
         for secret in SECRETS.values():
-            if secret != SECRETS["AGORA_APP_ID"]:
-                self.assertNotIn(secret, r.text)
-        join = self.calls[0]
-        self.assertTrue(join.headers["authorization"].startswith("Basic "))
-        body = json.loads(join.content)["properties"]
-        self.assertEqual(body["tts"]["vendor"], "murf")
-        self.assertIn(body["tts"]["params"]["voiceId"], voice.PATIENT_VOICE_POOLS["F"])
-        # Same case id always maps to the same voice.
+            self.assertNotIn(secret, r.text)
+
+        prep = gemini_live.get_prepared_session(data["channel"])
+        self.assertIsNotNone(prep)
+        self.assertEqual(prep.initial_line, "Hi doc")
+        self.assertEqual(prep.system_prompt, "You are Raj.")
+        self.assertIn(prep.voice, gemini_tts.FEMALE_VOICES)
+
+    def test_start_voice_selection(self) -> None:
         self.assertEqual(voice._voice_for("F", "case-x"), voice._voice_for("F", "case-x"))
-        self.assertEqual(voice._voice_for("nurse"), "en-IN-anisha")
-        self.assertEqual(body["llm"]["style"], "openai")
-        self.assertIn("sarvam.ai", body["llm"]["url"])
-        self.assertEqual(body["asr"]["vendor"], "sarvam")
-        self.assertEqual(body["remote_rtc_uids"], [str(data["uid"])])
-        self.assertEqual(body["agent_rtc_uid"], "900001")
-        self.assertEqual(body["llm"]["system_messages"][0]["content"], "You are Raj.")
-        self.assertEqual(body["llm"]["greeting_message"], "Hi doc")
-
-    def test_join_has_static_filler_words(self) -> None:
-        r = self.client.post("/voice/start", headers=HDR, json={
-            "caseId": "c", "systemPrompt": "x", "initialLine": "y", "gender": "M"})
-        self.assertEqual(r.status_code, 200, r.text)
-        fw = json.loads(self.calls[0].content)["properties"]["filler_words"]
-        self.assertTrue(fw["enable"])
-        self.assertEqual(fw["trigger"]["fixed_time_config"]["response_wait_ms"], 1100)
-        self.assertEqual(fw["content"]["mode"], "static")
-        self.assertNotIn("generated_config", fw["content"])
-        self.assertEqual(fw["content"]["static_config"]["selection_rule"], "shuffle")
-        self.assertIn("Hmm...", fw["content"]["static_config"]["phrases"])
-
-    def test_join_retries_without_filler_when_rejected(self) -> None:
-        calls: list[dict] = []
-
-        def handler(req: httpx.Request) -> httpx.Response:
-            body = json.loads(req.content)
-            calls.append(body)
-            if "filler_words" in body["properties"]:
-                return httpx.Response(400, json={"reason": "InvalidFieldValue: filler_words not supported"})
-            return httpx.Response(200, json={"agent_id": "AGENT9"})
-
-        voice._client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        r = self.client.post("/voice/start", headers=HDR, json={
-            "caseId": "c", "systemPrompt": "x", "initialLine": "y", "gender": "M"})
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(len(calls), 2)
-        self.assertNotIn("filler_words", calls[1]["properties"])
-
-    def test_ares_asr_when_voice_asr_ares(self) -> None:
-        os.environ["VOICE_ASR"] = "ares"
-        r = self.client.post("/voice/start", headers=HDR, json={
-            "caseId": "c", "systemPrompt": "x", "initialLine": "y", "gender": "M"})
-        self.assertEqual(r.status_code, 200, r.text)
-        body = json.loads(self.calls[0].content)["properties"]
-        self.assertEqual(body["asr"]["vendor"], "ares")
+        self.assertEqual(voice._voice_for("nurse"), "Aoede")
 
     def test_missing_config_is_503_without_values(self) -> None:
-        os.environ.pop("MURF_API_KEY")
+        os.environ.pop("GEMINI_API_KEY", None)
         r = self.client.post("/voice/start", headers=HDR, json={
-            "caseId": "c", "systemPrompt": "x", "initialLine": "y", "gender": "M"})
+            "caseId": "c", "systemPrompt": "x", "initialLine": "y", "gender": "M"
+        })
         self.assertEqual(r.status_code, 503)
-        self.assertIn("MURF_API_KEY", r.text)
+        self.assertIn("GEMINI_API_KEY", r.text)
 
-    def test_agora_error_is_502_with_body(self) -> None:
-        voice._client_factory = lambda: httpx.AsyncClient(
-            transport=httpx.MockTransport(lambda req: httpx.Response(400, json={"detail": "bad", "reason": "nope"})))
-        r = self.client.post("/voice/start", headers=HDR, json={
-            "caseId": "c", "systemPrompt": "x", "initialLine": "y", "gender": "M"})
-        self.assertEqual(r.status_code, 502)
-        self.assertIn("nope", r.text)
+    def test_stop_is_idempotent(self) -> None:
+        r = self.client.post("/voice/stop", headers=HDR, json={"agentId": "gone"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["ok"])
+
+    def test_voice_tts_success(self) -> None:
+        async def fake_synth(text, voice="Aoede"):
+            return (gemini_tts.wrap_pcm_in_wav(b"\x00\x00" * 50, 24000), "audio/wav")
+
+        orig_synth = gemini_tts.synthesize_speech
+        gemini_tts.synthesize_speech = fake_synth
+        try:
+            r = self.client.post("/voice/tts", headers=HDR, json={
+                "text": "Hello doctor", "voice": "nurse"
+            })
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.headers.get("content-type"), "audio/wav")
+            self.assertTrue(r.content.startswith(b"RIFF"))
+        finally:
+            gemini_tts.synthesize_speech = orig_synth
+
+    def test_voice_tts_error_handling(self) -> None:
+        async def fake_fail(text, voice="Aoede"):
+            raise RuntimeError("Upstream TTS failure")
+
+        orig_synth = gemini_tts.synthesize_speech
+        gemini_tts.synthesize_speech = fake_fail
+        try:
+            r = self.client.post("/voice/tts", headers=HDR, json={
+                "text": "Hello doctor", "voice": "nurse"
+            })
+            self.assertEqual(r.status_code, 502)
+            self.assertIn("Gemini TTS failed", r.text)
+        finally:
+            gemini_tts.synthesize_speech = orig_synth
 
     def test_stop_is_idempotent(self) -> None:
         r = self.client.post("/voice/stop", headers=HDR, json={"agentId": "gone"})

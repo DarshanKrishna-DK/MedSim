@@ -1,0 +1,35 @@
+steps:
+  # 1. Build container image using Dockerfile
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/medsim-gemini:$COMMIT_SHA', '-t', 'gcr.io/$PROJECT_ID/medsim-gemini:latest', '.']
+
+  # 2. Push container image to Google Artifact Registry / GCR
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/medsim-gemini:$COMMIT_SHA']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/medsim-gemini:latest']
+
+  # 3. Deploy to Cloud Run with strict Gemini parameters & session affinity
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'medsim-gemini'
+      - '--image=gcr.io/$PROJECT_ID/medsim-gemini:$COMMIT_SHA'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--timeout=3600'
+      - '--session-affinity'
+      - '--no-use-http2'
+      - '--min-instances=0'
+      - '--max-instances=3'
+      - '--memory=1Gi'
+      - '--cpu=1'
+      - '--port=8080'
+      - '--allow-unauthenticated'
+
+images:
+  - 'gcr.io/$PROJECT_ID/medsim-gemini:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/medsim-gemini:latest'

@@ -19,10 +19,11 @@ const PROXY = {
     target: BACKEND,
     changeOrigin: true,
   },
-  // Real-time voice, backend mints Agora RTC/RTM tokens and starts the Conversational AI agent.
+  // Real-time voice: Gemini Live & Observer WebSockets + REST control endpoints.
   '^/voice/': {
     target: BACKEND,
     changeOrigin: true,
+    ws: true,
   },
   // Teacher Portal lessons + typed Q&A (backend/teacher.py).
   '^/teach/': {
@@ -43,6 +44,9 @@ const PROXY = {
 
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    preserveSymlinks: true,
+  },
   server: {
     port: 5173,
     open: false, // never auto-open a browser tab; reuse the one already open

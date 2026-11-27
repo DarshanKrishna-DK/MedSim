@@ -51,20 +51,23 @@ _sends: dict[str, list[float]] = {}
 # ------------------------------------------------------------------ audio hosting
 
 
-def store_audio(mp3: bytes) -> str:
-    """Keep the MP3 in memory and return its public path '/rx/audio/<token>.mp3'."""
+def store_audio(audio_bytes: bytes) -> str:
+    """Keep the audio (WAV or MP3) in memory and return its public path '/rx/audio/<token>.(wav|mp3)'."""
     now = time.time()
     token = secrets.token_urlsafe(16)
+    b = bytes(audio_bytes)
+    ext = "wav" if b.startswith(b"RIFF") else "mp3"
     with _lock:
         for k in [k for k, (t, _) in _audio.items() if now - t > AUDIO_TTL_S]:
             del _audio[k]
         while len(_audio) >= AUDIO_MAX:
             del _audio[min(_audio, key=lambda k: _audio[k][0])]
-        _audio[token] = (now, bytes(mp3))
-    return f"/rx/audio/{token}.mp3"
+        _audio[token] = (now, b)
+    return f"/rx/audio/{token}.{ext}"
 
 
 @router.get("/rx/audio/{token}.mp3")
+@router.get("/rx/audio/{token}.wav")
 async def rx_audio_file(token: str) -> Response:
     with _lock:
         item = _audio.get(token)
@@ -73,7 +76,8 @@ async def rx_audio_file(token: str) -> Response:
             item = None
     if not item:
         raise HTTPException(status_code=404, detail="Not found")
-    return Response(content=item[1], media_type="audio/mpeg", headers={"Cache-Control": "private, max-age=3600"})
+    media_type = "audio/wav" if item[1].startswith(b"RIFF") else "audio/mpeg"
+    return Response(content=item[1], media_type=media_type, headers={"Cache-Control": "private, max-age=3600"})
 
 
 def absolute_url(path: str) -> Optional[str]:
@@ -312,7 +316,9 @@ async def _send_email(addr: str, message: str, mp3: Optional[bytes], ics: Option
     msg["Message-ID"] = f"<{secrets.token_hex(12)}@medsim.local>"
     msg.set_content(message)
     if mp3:
-        msg.add_attachment(mp3, maintype="audio", subtype="mpeg", filename="prescription.mp3")
+        subtype = "wav" if mp3.startswith(b"RIFF") else "mpeg"
+        fname = f"prescription.{subtype}"
+        msg.add_attachment(mp3, maintype="audio", subtype=subtype, filename=fname)
     if ics:
         msg.add_attachment(ics, maintype="text", subtype="calendar", filename="follow-up.ics")
     try:
@@ -463,9 +469,11 @@ async def _send_telegram(dest: str, message: str, mp3: Optional[bytes], ics: Opt
                 "resolvedTo": resolved}
         if mp3:
             try:
+                subtype = "audio/wav" if mp3.startswith(b"RIFF") else "audio/mpeg"
+                fname = "prescription.wav" if mp3.startswith(b"RIFF") else "prescription.mp3"
                 a = await c.post(_tg_url("sendAudio"), data={"chat_id": str(chat_id), "title": "Your prescription (MedSim)",
                                                               "performer": "MedSim Clinic"},
-                                 files={"audio": ("prescription.mp3", mp3, "audio/mpeg")})
+                                 files={"audio": (fname, mp3, subtype)})
                 sent["audioSent"] = bool(a.content and a.json().get("ok"))
             except Exception as e:  # noqa: BLE001
                 log.warning("telegram sendAudio failed: %s", type(e).__name__)
@@ -532,7 +540,8 @@ async def send_telegram_bundle(
                                                    {"caption": caption[:1000]} if caption else {})
             if audio:
                 name, data, title = audio
-                parts["audio"] = await _tg_file(c, "sendAudio", "audio", chat_id, name, data, "audio/mpeg",
+                mime = "audio/wav" if (name.endswith(".wav") or data.startswith(b"RIFF")) else "audio/mpeg"
+                parts["audio"] = await _tg_file(c, "sendAudio", "audio", chat_id, name, data, mime,
                                                 {"title": title[:64], "performer": "MedSim"})
     except Exception as e:  # noqa: BLE001
         return _fail("telegram", d, f"Unexpected error: {type(e).__name__}")

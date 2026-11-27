@@ -4,7 +4,7 @@ The client sends the station encounter (transcript, action log, diagnosis),
 the case rubric (authored or auto-derived, `CaseRubric` shape) and the coach
 alerts that were collected silently during the station. We build a checklist
 from the rubric plus four standard station tasks, ask the OpenAI-compatible
-provider (Sarvam first, Groq fallback) for strict JSON verdicts, then do the
+provider powered by Gemini for strict JSON verdicts, then do the
 arithmetic ourselves:
 
 - every checklist item is met / partial / not-met; items the model skipped
@@ -388,7 +388,11 @@ async def debrief_osce(req: OsceRequest):
         return no_interaction_result(req, checklist)
     msg, _ = await chat(
         [{"role": "system", "content": SYSTEM}, {"role": "user", "content": _user_payload(req, checklist)}],
-        json_mode=True, max_tokens=2600, temperature=0.1,
+        json_mode=True,
+        max_tokens=2600,
+        temperature=0.1,
+        tier="reasoning",
+        effort="medium",
     )
     try:
         raw = parse_json_object(msg.get("content") or "")

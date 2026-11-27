@@ -1,6 +1,5 @@
 """Asha follow-up call: the patient opens /call/<token> on their phone and talks
-to Nurse Asha, an Agora Conversational AI agent (Sarvam ASR + LLM, Murf Falcon
-TTS). Roles are reversed from the clinic: the agent is the nurse, the human is
+to Nurse Asha, a Gemini Live agent. Roles are reversed from the clinic: the agent is the nurse, the human is
 the patient. Afterwards the transcript becomes a structured summary the doctor
 sees in the Plan tab.
 
@@ -441,8 +440,8 @@ async def _call_start_locked(token: str, snap: dict[str, Any]):
     h = _hist(token)
     started = time.time()
     call_id = secrets.token_hex(6)
-    # Tools run in our LLM proxy, so Asha can act only when Agora reaches it.
-    acting = voice.llm_proxy.public_url() is not None
+    # Gemini Live executes Asha's clinical tools directly
+    acting = True
     h["starts"].append(started)  # counted before the join so parallel taps cannot exceed the cap
     lang = langmod.norm_lang(snap.get("lang"))
     req = voice.VoiceStartRequest(
@@ -455,24 +454,30 @@ async def _call_start_locked(token: str, snap: dict[str, Any]):
     _joining["n"] += 1
     try:
         session = await voice.start_agent_session(
-            req, voice_kind="nurse", channel_prefix="asha", idle_timeout=IDLE_TIMEOUT_S, translate_greeting=False,
+            req,
+            voice_kind="nurse",
+            channel_prefix="asha",
+            idle_timeout=IDLE_TIMEOUT_S,
+            translate_greeting=False,
             llm_token_meta={"kind": "followup", "callToken": token, "callId": call_id},
+            agent_kind="followup",
         )
     except Exception as e:  # noqa: BLE001
         if started in h["starts"]:
             h["starts"].remove(started)  # a failed join costs no Agora minutes
-        # The patient's phone never sees upstream (Agora) error bodies.
+        # The patient's phone never sees upstream error bodies.
         detail = e.detail if isinstance(e, HTTPException) else type(e).__name__
         log.warning("follow-up call start failed: %s", str(detail)[:300])
         status = e.status_code if isinstance(e, HTTPException) and e.status_code == 503 else 502
         raise HTTPException(status_code=status, detail="Could not connect to Nurse Asha right now. Please try again in a minute.")
     finally:
         _joining["n"] -= 1
-    if session.avatarError:
-        log.warning("follow-up call avatar: %s", session.avatarError[:300])
+    avatar_err = session.avatarError or session.avatar_error
+    if avatar_err:
+        log.warning("follow-up call avatar: %s", str(avatar_err)[:300])
     call = {
         "callId": call_id,
-        "agentId": session.agentId,
+        "agentId": session.agentId or session.agent_id,
         "startedAt": int(started * 1000),
         "endedAt": None,
         "summary": None,
@@ -483,7 +488,7 @@ async def _call_start_locked(token: str, snap: dict[str, Any]):
     del h["calls"][:-20]
     _schedule_guard(call, lang)
     return {
-        **session.model_dump(exclude={"avatarError"}),
+        **session.model_dump(exclude={"avatarError", "avatar_error"}),
         "callId": call["callId"],
         "maxSeconds": MAX_SESSION_S,
         "callsLeftToday": calls_left(token),

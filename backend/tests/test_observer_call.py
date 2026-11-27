@@ -36,6 +36,7 @@ ENV = {
     "TWILIO_ACCOUNT_SID": "AC" + "0" * 32,
     "TWILIO_AUTH_TOKEN": "twilio-test-token",
     "TWILIO_VOICE_FROM": "+17372508034",
+    "GEMINI_API_KEY": "fake-gemini-key",
     "MURF_API_KEY": "murf-test",
     "SARVAM_API_KEY": "sarvam-test",
     "TELEGRAM_BOT_TOKEN": "",
